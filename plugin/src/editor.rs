@@ -30,9 +30,7 @@ use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
-// DYN_ROWS is unused while the dynamic section is hidden, but keep the
-// import commented so re-enabling is a one-line change.
-use crate::params::{CComidiParams, FIXED_ROWS /*, DYN_ROWS */};
+use crate::params::{CComidiParams, DYN_ROWS, FIXED_ROWS};
 use crate::voicegroup::{self, VoicegroupState};
 
 /// User-facing labels for the six fixed rows. Indexed 0..FIXED_ROWS.
@@ -41,6 +39,26 @@ use crate::voicegroup::{self, VoicegroupState};
 const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
     "Volume", "Pan", "Mod", "LFO Speed", "xCIEV", "xCIEL",
 ];
+
+/// Which page of the editor is currently visible.
+///
+/// Vizia's `Data` trait is required for any type used as a lens target.
+/// We implement it manually here — `#[derive(Data)]` can't resolve the
+/// trait name because our own `struct Data` (the root model) shadows
+/// Vizia's `Data` in this file's scope.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Tab {
+    /// Output channel, Program, Fixed commands, Voicegroup.
+    Main,
+    /// The 10 freely-assignable (non-fixed) rows.
+    Additional,
+}
+
+impl nih_plug_vizia::vizia::prelude::Data for Tab {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
 
 /// Messages the editor fires at itself.
 ///
@@ -52,10 +70,12 @@ const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
 ///   `pending_add_instrument` atomic so the audio thread emits CC#98/#99
 ///   on its next block — matching the C++ "pick = send" UX. The
 ///   selection itself is transient (not persisted).
+/// - `SwitchTab(tab)` flips the top-level page.
 #[derive(Debug)]
 enum AppEvent {
     ReloadVoicegroup,
     SelectInstrument(usize),
+    SwitchTab(Tab),
 }
 
 /// Root Vizia model.
@@ -73,6 +93,10 @@ struct Data {
     /// Index of the currently highlighted entry in `instruments`.
     /// Purely UI state (matches C++'s un-persisted `availableSelection`).
     selected_instrument: usize,
+    /// Which top-level page is on screen. Ephemeral — resets to `Main`
+    /// every time the editor is opened. Row param values persist via
+    /// nih-plug regardless of tab visibility, so this doesn't hide data.
+    active_tab: Tab,
 }
 
 impl Model for Data {
@@ -102,15 +126,18 @@ impl Model for Data {
                         .store(*idx as i32, Ordering::Release);
                 }
             }
+            AppEvent::SwitchTab(tab) => {
+                self.active_tab = *tab;
+            }
         });
     }
 }
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // Height bumped again to accommodate two new fixed rows (xCIEV /
-    // xCIEL) — 2 × 28 = 56 additional pixels — plus a little breathing
-    // room around the voicegroup section.
-    ViziaState::new_with_default_scale_factor(|| (600, 560), 1.25)
+    // Height grown another 60px to seat the tab bar above the content.
+    // The Additional Commands page is shorter than Main, so this size
+    // is driven by Main's content + tabs.
+    ViziaState::new_with_default_scale_factor(|| (600, 620), 1.25)
 }
 
 pub(crate) fn create(
@@ -134,6 +161,7 @@ pub(crate) fn create(
             vg_status: initial_status,
             instruments: initial_state.available_instruments,
             selected_instrument: 0,
+            active_tab: Tab::Main,
         }
         .build(cx);
 
@@ -143,24 +171,18 @@ pub(crate) fn create(
                 .height(Pixels(36.0))
                 .child_space(Stretch(1.0));
 
-            transport_row(cx);
+            tab_bar(cx);
 
-            section_header(cx, "Fixed commands");
-            for i in 0..FIXED_ROWS {
-                fixed_row(cx, i);
-            }
-
-            section_header(cx, "Voicegroup");
-            voicegroup_row(cx);
-            add_instrument_row(cx);
-
-            // Dynamic commands section hidden while diagnosing GUI lag:
-            //
-            //   section_header(cx, "Dynamic commands");
-            //   dynamic_header(cx);
-            //   for i in 0..DYN_ROWS {
-            //       dynamic_row(cx, i);
-            //   }
+            // `Binding` rebuilds its children whenever the lens value
+            // changes — so switching tabs destroys one page's widget
+            // tree and builds the other's. Param values live on the
+            // params struct (not in widgets), so nothing is lost when
+            // a tab swaps out: switching back rebinds the widgets to
+            // the same underlying state.
+            Binding::new(cx, Data::active_tab, |cx, tab| match tab.get(cx) {
+                Tab::Main => main_tab_content(cx),
+                Tab::Additional => additional_tab_content(cx),
+            });
         })
         .font_family(vec![FamilyOwned::Name(String::from("Calamity"))])
         // Rhythm: 8px between stacked rows, 12px inset on top/bottom, 4px
@@ -170,6 +192,75 @@ pub(crate) fn create(
         .child_top(Pixels(12.0))
         .child_bottom(Pixels(12.0));
     })
+}
+
+// -----------------------------------------------------------------------------
+// Top-level tab bar
+// -----------------------------------------------------------------------------
+
+fn tab_bar(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        tab_button(cx, "Main", Tab::Main, 120.0);
+        tab_button(cx, "Additional Commands", Tab::Additional, 200.0);
+    })
+    .height(Pixels(38.0))
+    .col_between(Pixels(4.0))
+    .child_left(Pixels(16.0))
+    .child_top(Pixels(4.0))
+    .child_bottom(Pixels(4.0));
+}
+
+fn tab_button(cx: &mut Context, label: &str, tab: Tab, width: f32) {
+    let owned_label = label.to_string();
+    Button::new(
+        cx,
+        move |cx| cx.emit(AppEvent::SwitchTab(tab)),
+        move |cx| {
+            Label::new(cx, owned_label.as_str())
+                .font_size(12.0)
+                .color(Color::white())
+                .child_space(Stretch(1.0))
+        },
+    )
+    .width(Pixels(width))
+    .height(Pixels(30.0))
+    .border_radius(Pixels(6.0))
+    .cursor(CursorIcon::Hand)
+    .background_color(Data::active_tab.map(move |t| {
+        if *t == tab {
+            Color::rgb(110, 140, 220)
+        } else {
+            Color::rgb(60, 60, 70)
+        }
+    }));
+}
+
+// -----------------------------------------------------------------------------
+// Tab content
+// -----------------------------------------------------------------------------
+
+/// Everything under the Main tab — the routing + fixed-row + voicegroup page.
+fn main_tab_content(cx: &mut Context) {
+    transport_row(cx);
+
+    section_header(cx, "Fixed commands");
+    for i in 0..FIXED_ROWS {
+        fixed_row(cx, i);
+    }
+
+    section_header(cx, "Voicegroup");
+    voicegroup_row(cx);
+    add_instrument_row(cx);
+}
+
+/// The Additional Commands tab: a table of the freely-assignable rows.
+/// Row count comes from `DYN_ROWS` (= `MAX_ROWS - FIXED_ROW_COUNT`).
+fn additional_tab_content(cx: &mut Context) {
+    section_header(cx, "Additional Commands");
+    dynamic_header(cx);
+    for i in 0..DYN_ROWS {
+        dynamic_row(cx, i);
+    }
 }
 
 /// Transport area: channel radio row on top, program controls below.
@@ -478,32 +569,38 @@ fn format_status(state: &VoicegroupState) -> String {
 // Dynamic row helpers — hidden while diagnosing lag, kept to re-enable easily.
 // -----------------------------------------------------------------------------
 
-#[allow(dead_code)]
+/// Caption row above the dynamic table.
 fn dynamic_header(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        Label::new(cx, "Row").font_size(10.0).width(Pixels(100.0));
-        Label::new(cx, "Command").font_size(10.0).width(Pixels(200.0));
+        Label::new(cx, "On").font_size(10.0).width(Pixels(32.0));
+        Label::new(cx, "Command").font_size(10.0).width(Pixels(180.0));
         for field in ["f0", "f1", "f2", "f3"] {
-            Label::new(cx, field).font_size(10.0).width(Pixels(96.0));
+            Label::new(cx, field).font_size(10.0).width(Pixels(72.0));
         }
     })
-    .col_between(Pixels(8.0))
+    .col_between(Pixels(6.0))
     .height(Pixels(16.0))
     .child_left(Pixels(16.0));
 }
 
-#[allow(dead_code)]
+/// One configurable row in the Additional Commands table.
+///
+/// Sizes are tuned for the 600-wide window:
+///   32 (toggle) + 180 (cmd) + 4 × 72 (fields) + 5 × 6 (gaps) + 16 (left)
+///   = 546 px, well inside the window.
 fn dynamic_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
-        ParamButton::new(cx, Data::params, move |p| &p.dyn_rows[i].enabled)
-            .width(Pixels(100.0));
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].cmd).width(Pixels(200.0));
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f0).width(Pixels(96.0));
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f1).width(Pixels(96.0));
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f2).width(Pixels(96.0));
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f3).width(Pixels(96.0));
+        bool_toggle(cx, move |p| &p.dyn_rows[i].enabled);
+        // ParamSlider over an EnumParam cycles through variants — not
+        // the prettiest widget for long enum lists, but avoids the cost
+        // of per-row PickLists.
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].cmd).width(Pixels(180.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f0).width(Pixels(72.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f1).width(Pixels(72.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f2).width(Pixels(72.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f3).width(Pixels(72.0));
     })
-    .col_between(Pixels(8.0))
-    .height(Pixels(26.0))
+    .col_between(Pixels(6.0))
+    .height(Pixels(28.0))
     .child_left(Pixels(16.0));
 }
