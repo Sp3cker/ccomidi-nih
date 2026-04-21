@@ -6,7 +6,7 @@
 //!   1. Title row
 //!   2. Transport row: MIDI channel, Program-enable toggle, Program number
 //!   3. "Fixed commands" section: Volume / Pan / Mod / LFO Speed (4 rows)
-//!   4. "Voicegroup" section: status + Reload, index slider + Add button
+//!   4. "Voicegroup" section: status + Reload, instrument dropdown + Add
 //!   5. (hidden for perf diag) "Dynamic commands": 12 freely-assignable rows
 //!
 //! # Vizia idioms used here
@@ -18,10 +18,11 @@
 //!   `Fn(&Params) -> &Param` closure that picks out one leaf. The closure
 //!   must be `'static + Copy` so we capture `i: usize` by `move` inside
 //!   each loop.
-//! - Non-param UI state (voicegroup status text) lives in `Data` as a
-//!   plain `String`. It's mutated inside `Model::event` in response to
-//!   `AppEvent`s emitted from button presses.
+//! - Non-param UI state (voicegroup status, instrument list, selection)
+//!   lives in `Data` as plain fields. It's mutated inside `Model::event`
+//!   in response to `AppEvent`s emitted from button presses.
 
+use nih_plug::params::BoolParam;
 use nih_plug::prelude::{Editor, Param};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
@@ -33,6 +34,13 @@ use std::sync::Arc;
 // import commented so re-enabling is a one-line change.
 use crate::params::{CComidiParams, FIXED_ROWS /*, DYN_ROWS */};
 use crate::voicegroup::{self, VoicegroupState};
+
+/// User-facing labels for the six fixed rows. Indexed 0..FIXED_ROWS.
+/// The enabled toggle is now a plain colored square (see `bool_toggle`);
+/// these labels sit beside it so the user can read what the row does.
+const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
+    "Volume", "Pan", "Mod", "LFO Speed", "xCIEV", "xCIEL",
+];
 
 /// Messages the editor fires at itself.
 ///
@@ -76,10 +84,10 @@ impl Model for Data {
 }
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // 1.25 user scale carries over; height grown to fit the centered
-    // "Output channel" caption above the button row plus the voicegroup
-    // section at the bottom that was clipping at 400.
-    ViziaState::new_with_default_scale_factor(|| (600, 500), 1.25)
+    // Height bumped again to accommodate two new fixed rows (xCIEV /
+    // xCIEL) — 2 × 28 = 56 additional pixels — plus a little breathing
+    // room around the voicegroup section.
+    ViziaState::new_with_default_scale_factor(|| (600, 560), 1.25)
 }
 
 pub(crate) fn create(
@@ -213,14 +221,16 @@ fn channel_radio_button(cx: &mut Context, ch: u8) {
         },
     )
     // 32×26 → more generous hit area than 28×22 without blowing out the
-    // row width (16 × 32 + 15 × 4 = 572, still inside the 600-wide window).
+    // row width (16 × 32 + 15 × 3 = 557, inside the 600-wide window).
     .width(Pixels(32.0))
     .height(Pixels(26.0))
     // Concentric radius: buttons sit inside a parent that has no radius,
     // so the button radius is free to pick up shape on its own. 5px reads
-    // as "pill-ish square" and is consistent with the 6px used on the
-    // larger Reload/Add buttons below (outer = inner + a touch of padding).
+    // as "pill-ish square" and matches the `bool_toggle` below.
     .border_radius(Pixels(5.0))
+    // Pointing-hand cursor on hover signals the button is clickable,
+    // consistent with web / macOS native button expectations.
+    .cursor(CursorIcon::Hand)
     // Selected button gets a distinct fill. `.map(…)` on a lens produces a
     // new lens whose target is the mapped value — so this cell's background
     // automatically re-renders when the channel param changes from any
@@ -235,11 +245,24 @@ fn channel_radio_button(cx: &mut Context, ch: u8) {
 }
 
 /// Program-enable toggle + Program-number slider, side by side.
+///
+/// "Program On" is now rendered as a tiny colored rectangle next to a
+/// plain text label — no longer a fat button with the label baked in.
 fn program_row(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        labeled_control(cx, "Program On", 90.0, |cx| {
-            ParamButton::new(cx, Data::params, |p| &p.program_enabled);
-        });
+        HStack::new(cx, |cx| {
+            bool_toggle(cx, |p| &p.program_enabled);
+            Label::new(cx, "Program On")
+                .font_size(11.0)
+                .child_top(Stretch(1.0))
+                .child_bottom(Stretch(1.0));
+        })
+        .col_between(Pixels(8.0))
+        .width(Pixels(130.0))
+        .height(Pixels(32.0))
+        .child_top(Stretch(1.0))
+        .child_bottom(Stretch(1.0));
+
         labeled_control(cx, "Program", 180.0, |cx| {
             ParamSlider::new(cx, Data::params, |p| &p.program).width(Pixels(170.0));
         });
@@ -321,19 +344,71 @@ fn section_header(cx: &mut Context, title: &str) {
         .child_left(Pixels(16.0));
 }
 
-/// A fixed-row: enable toggle (whose label is the row name) + value slider.
+/// A fixed-row: toggle (colored square) + text label + value slider.
 fn fixed_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
-        ParamButton::new(cx, Data::params, move |p| &p.fixed_rows[i].enabled)
-            .width(Pixels(110.0));
+        bool_toggle(cx, move |p| &p.fixed_rows[i].enabled);
 
-        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(370.0));
+        Label::new(cx, FIXED_ROW_LABELS[i])
+            .font_size(11.0)
+            .width(Pixels(90.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(400.0));
     })
     .col_between(Pixels(8.0))
     // 28px row height to match the channel row, giving the whole table a
     // uniform vertical cadence.
     .height(Pixels(28.0))
     .child_left(Pixels(16.0));
+}
+
+/// Tiny colored-square toggle bound to a [`BoolParam`].
+///
+/// # Why not `ParamButton`?
+///
+/// `ParamButton` renders the param's display name as its on-button text.
+/// We want the label on the outside — so we roll our own:
+///
+/// - The visible square is ~32×22 and changes color based on state
+///   (blue when `true`, dark when `false`). The color is lens-bound, so
+///   it repaints automatically when the param changes from any source.
+/// - A pointing-hand cursor on hover signals it's clickable.
+/// - Clicking emits the standard nih-plug param-update trio the host
+///   expects (Begin / SetNormalized / End).
+fn bool_toggle<F>(cx: &mut Context, getter: F)
+where
+    F: Fn(&CComidiParams) -> &BoolParam + Copy + Send + Sync + 'static,
+{
+    Button::new(
+        cx,
+        move |cx| {
+            // Snapshot the Arc, pull out the specific `BoolParam`, and
+            // flip its value through the nih-plug event path.
+            let params = Data::params.get(cx);
+            let param = getter(params.as_ref());
+            let ptr = param.as_ptr();
+            let normalized = if param.value() { 0.0 } else { 1.0 };
+            cx.emit(RawParamEvent::BeginSetParameter(ptr));
+            cx.emit(RawParamEvent::SetParameterNormalized(ptr, normalized));
+            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        },
+        // Intentional: empty body — no label inside the button. The caller
+        // places a `Label` next to the toggle instead.
+        |cx| Label::new(cx, ""),
+    )
+    .width(Pixels(32.0))
+    .height(Pixels(22.0))
+    .border_radius(Pixels(5.0))
+    .cursor(CursorIcon::Hand)
+    .background_color(Data::params.map(move |p| {
+        if getter(p).value() {
+            Color::rgb(110, 140, 220)
+        } else {
+            Color::rgb(60, 60, 70)
+        }
+    }));
 }
 
 // -----------------------------------------------------------------------------

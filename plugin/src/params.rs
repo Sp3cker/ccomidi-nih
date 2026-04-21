@@ -103,14 +103,12 @@ pub struct FixedRowParams {
 }
 
 impl FixedRowParams {
-    fn new(label: &str) -> Self {
+    fn new(label: &str, default_enabled: bool, default_value: i32) -> Self {
         Self {
-            // Short display-name so the button widget doesn't overflow:
-            // just the row name itself. The toggle state IS the "on" signal.
-            enabled: BoolParam::new(label, false),
+            enabled: BoolParam::new(label, default_enabled),
             value: IntParam::new(
                 format!("{label} Value"),
-                0,
+                default_value,
                 IntRange::Linear { min: 0, max: 127 },
             ),
         }
@@ -170,9 +168,9 @@ impl DynamicRowParams {
 /// Fixed-row array length — kept as a literal in the type signature because
 /// `#[derive(Params)]` runs before const evaluation. `FIXED_ROW_COUNT` from
 /// `core` is enforced equal by the `static_assertions` below.
-pub const FIXED_ROWS: usize = 4;
+pub const FIXED_ROWS: usize = 6;
 /// Dynamic-row array length (`MAX_ROWS - FIXED_ROW_COUNT`).
-pub const DYN_ROWS: usize = 12;
+pub const DYN_ROWS: usize = 10;
 
 // Compile-time sanity: if someone ever changes the core constants, this
 // refuses to compile rather than silently going out of sync.
@@ -194,10 +192,9 @@ pub struct CComidiParams {
     #[id = "p"]
     pub program: IntParam,
 
-    /// 14-bit index of the next instrument to append to the voicegroup.
-    /// Range 0..=16383 (CC#98 LSB + CC#99 MSB). Clicking the "Add
-    /// Instrument" button in the editor reads this value and writes it
-    /// to the plugin's `pending_add_instrument` atomic.
+    /// 14-bit index for the Add-Instrument CC#98/#99 pair. Restored after
+    /// an in-progress refactor temporarily removed it; still referenced
+    /// by `editor.rs::add_instrument_row`.
     #[id = "ai"]
     pub add_instrument_index: IntParam,
 
@@ -220,7 +217,10 @@ impl Default for CComidiParams {
 
             channel: IntParam::new("Channel", 0, IntRange::Linear { min: 0, max: 15 }),
 
-            program_enabled: BoolParam::new("Program On", false),
+            // Default on — the sender plugin's job is to drive a synth,
+            // and most hosts expect Program Change to fire on transport
+            // start. The user can still toggle it off.
+            program_enabled: BoolParam::new("Program On", true),
             program: IntParam::new("Program", 0, IntRange::Linear { min: 0, max: 127 }),
 
             add_instrument_index: IntParam::new(
@@ -232,11 +232,17 @@ impl Default for CComidiParams {
                 },
             ),
 
+            // Volume and Pan default enabled at 64 (center/half) so a
+            // freshly-inserted plugin makes audible sound without having
+            // to click two toggles. Mod / LFO Speed / xCIEV / xCIEL stay
+            // off because their effect varies heavily per voicegroup.
             fixed_rows: [
-                FixedRowParams::new("Volume"),
-                FixedRowParams::new("Pan"),
-                FixedRowParams::new("Mod"),
-                FixedRowParams::new("LFO Speed"),
+                FixedRowParams::new("Volume", true, 64),
+                FixedRowParams::new("Pan", true, 64),
+                FixedRowParams::new("Mod", false, 0),
+                FixedRowParams::new("LFO Speed", false, 0),
+                FixedRowParams::new("xCIEV", false, 0),
+                FixedRowParams::new("xCIEL", false, 0),
             ],
 
             // `std::array::from_fn` takes a `fn(usize) -> T` and produces a

@@ -9,10 +9,10 @@
 pub const MAX_ROWS: usize = 16;
 
 /// The first `FIXED_ROW_COUNT` rows have *fixed* [`CommandType`]s
-/// (Volume / Pan / Mod / LfoSpeed) — the user cannot change what CC they
-/// emit, only the value. Rows `[FIXED_ROW_COUNT..MAX_ROWS)` are freely
-/// assignable.
-pub const FIXED_ROW_COUNT: usize = 4;
+/// (Volume / Pan / Mod / LfoSpeed / XcmdIecv / XcmdIecl) — the user cannot
+/// change what CC they emit, only the value. Rows
+/// `[FIXED_ROW_COUNT..MAX_ROWS)` are freely assignable.
+pub const FIXED_ROW_COUNT: usize = 6;
 
 /// Every row carries a fixed-size bank of 4 field values. Not every
 /// `CommandType` uses all 4 fields; unused fields are ignored at encode time.
@@ -96,15 +96,22 @@ impl CommandType {
             1 => Some(Self::Pan),
             2 => Some(Self::Mod),
             3 => Some(Self::LfoSpeed),
+            4 => Some(Self::XcmdIecv),
+            5 => Some(Self::XcmdIecl),
             _ => None,
         }
     }
 
-    /// True iff this is one of the four fixed-row commands.
+    /// True iff this is one of the six fixed-row commands.
     pub const fn is_fixed(self) -> bool {
         matches!(
             self,
-            Self::Volume | Self::Pan | Self::Mod | Self::LfoSpeed
+            Self::Volume
+                | Self::Pan
+                | Self::Mod
+                | Self::LfoSpeed
+                | Self::XcmdIecv
+                | Self::XcmdIecl
         )
     }
 
@@ -148,6 +155,8 @@ mod tests {
         assert_eq!(CommandType::fixed_for_row(1), Some(CommandType::Pan));
         assert_eq!(CommandType::fixed_for_row(2), Some(CommandType::Mod));
         assert_eq!(CommandType::fixed_for_row(3), Some(CommandType::LfoSpeed));
+        assert_eq!(CommandType::fixed_for_row(4), Some(CommandType::XcmdIecv));
+        assert_eq!(CommandType::fixed_for_row(5), Some(CommandType::XcmdIecl));
     }
 
     #[test]
