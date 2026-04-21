@@ -77,9 +77,9 @@ impl Model for Data {
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
     // 1.25 user scale carries over from the fixed-only window; logical
-    // size bumped to accommodate the voicegroup section and the new
-    // channel radio row (needs a bit more height than a single slider).
-    ViziaState::new_with_default_scale_factor(|| (540, 360), 1.25)
+    // width widened again so all 16 channel buttons fit comfortably with
+    // two-digit labels ("10".."16").
+    ViziaState::new_with_default_scale_factor(|| (600, 360), 1.25)
 }
 
 pub(crate) fn create(
@@ -187,9 +187,19 @@ fn channel_radio_button(cx: &mut Context, ch: u8) {
             cx.emit(RawParamEvent::SetParameterNormalized(ptr, normalized));
             cx.emit(RawParamEvent::EndSetParameter(ptr));
         },
-        move |cx| Label::new(cx, label.as_str()).font_size(10.0),
+        move |cx| {
+            // `child_space(Stretch(1.0))` centers the number horizontally
+            // and vertically inside the button. White text reads equally
+            // well on the blue "selected" fill and the dark-gray "idle"
+            // fill.
+            Label::new(cx, label.as_str())
+                .font_size(10.0)
+                .color(Color::white())
+                .child_space(Stretch(1.0))
+        },
     )
-    .width(Pixels(22.0))
+    // Wider than 22px so two-digit labels ("10".."16") don't clip.
+    .width(Pixels(28.0))
     .height(Pixels(22.0))
     // Selected button gets a distinct fill. `.map(…)` on a lens produces a
     // new lens whose target is the mapped value — so this cell's background
