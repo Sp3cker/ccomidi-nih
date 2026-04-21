@@ -22,7 +22,7 @@
 //!   plain `String`. It's mutated inside `Model::event` in response to
 //!   `AppEvent`s emitted from button presses.
 
-use nih_plug::prelude::Editor;
+use nih_plug::prelude::{Editor, Param};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
@@ -77,8 +77,9 @@ impl Model for Data {
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
     // 1.25 user scale carries over from the fixed-only window; logical
-    // size bumped to accommodate the voicegroup section.
-    ViziaState::new_with_default_scale_factor(|| (520, 320), 1.25)
+    // size bumped to accommodate the voicegroup section and the new
+    // channel radio row (needs a bit more height than a single slider).
+    ViziaState::new_with_default_scale_factor(|| (540, 360), 1.25)
 }
 
 pub(crate) fn create(
@@ -134,12 +135,78 @@ pub(crate) fn create(
     })
 }
 
-/// Channel + Program-enable + Program in a single row.
+/// Transport area: channel radio row on top, program controls below.
 fn transport_row(cx: &mut Context) {
+    channel_radio_row(cx);
+    program_row(cx);
+}
+
+/// 16 radio-style buttons, one per MIDI channel (1..=16 display, 0..=15 wire).
+/// Clicking a button normalizes the channel index and emits the three-event
+/// param-change sequence nih-plug expects from custom widgets.
+fn channel_radio_row(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        labeled_control(cx, "Channel", 100.0, |cx| {
-            ParamSlider::new(cx, Data::params, |p| &p.channel).width(Pixels(90.0));
-        });
+        Label::new(cx, "Channel")
+            .font_size(11.0)
+            .width(Pixels(60.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        for ch in 0u8..16 {
+            channel_radio_button(cx, ch);
+        }
+    })
+    .col_between(Pixels(2.0))
+    .height(Pixels(28.0))
+    .child_left(Pixels(12.0));
+}
+
+/// One of the 16 channel buttons.
+///
+/// # Custom param write
+///
+/// `ParamSlider`/`ParamButton` encapsulate the param-update protocol, but
+/// for a plain `Button` we emit the trio by hand:
+///   1. `BeginSetParameter`         — tells the host "user is editing"
+///   2. `SetParameterNormalized`    — the actual new [0.0, 1.0] value
+///   3. `EndSetParameter`           — host stops recording automation
+///
+/// `preview_normalized(plain)` is nih-plug's helper that maps `plain` (an
+/// `i32` in the param's range) to the normalized form the host expects.
+fn channel_radio_button(cx: &mut Context, ch: u8) {
+    let ch_i = ch as i32;
+    let label = format!("{}", ch + 1); // 1-indexed for UX
+
+    Button::new(
+        cx,
+        move |cx| {
+            let params = Data::params.get(cx);
+            let ptr = params.channel.as_ptr();
+            let normalized = params.channel.preview_normalized(ch_i);
+            cx.emit(RawParamEvent::BeginSetParameter(ptr));
+            cx.emit(RawParamEvent::SetParameterNormalized(ptr, normalized));
+            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        },
+        move |cx| Label::new(cx, label.as_str()).font_size(10.0),
+    )
+    .width(Pixels(22.0))
+    .height(Pixels(22.0))
+    // Selected button gets a distinct fill. `.map(…)` on a lens produces a
+    // new lens whose target is the mapped value — so this cell's background
+    // automatically re-renders when the channel param changes from any
+    // source (UI, host automation, preset recall, …).
+    .background_color(Data::params.map(move |p| {
+        if p.channel.value() == ch_i {
+            Color::rgb(110, 140, 220)
+        } else {
+            Color::rgb(60, 60, 70)
+        }
+    }));
+}
+
+/// Program-enable toggle + Program-number slider, side by side.
+fn program_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
         labeled_control(cx, "Program On", 90.0, |cx| {
             ParamButton::new(cx, Data::params, |p| &p.program_enabled);
         });
@@ -148,7 +215,7 @@ fn transport_row(cx: &mut Context) {
         });
     })
     .col_between(Pixels(12.0))
-    .height(Pixels(54.0))
+    .height(Pixels(50.0))
     .child_left(Pixels(12.0));
 }
 
