@@ -6,3 +6,6 @@ license = "MIT"
 
 [dependencies]
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+# `nih_plug_xtask::Result` is `anyhow::Result`, so we need the macro / type
+# directly to construct ad-hoc error messages.
+anyhow = "1"
