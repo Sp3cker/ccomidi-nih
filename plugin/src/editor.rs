@@ -76,10 +76,9 @@ impl Model for Data {
 }
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // 1.25 user scale carries over from the fixed-only window; logical
-    // width widened again so all 16 channel buttons fit comfortably with
-    // two-digit labels ("10".."16").
-    ViziaState::new_with_default_scale_factor(|| (600, 360), 1.25)
+    // 1.25 user scale carries over; height bumped to 400 so sections
+    // breathe — the rhythm-focused pass increased vertical padding.
+    ViziaState::new_with_default_scale_factor(|| (600, 400), 1.25)
 }
 
 pub(crate) fn create(
@@ -129,9 +128,12 @@ pub(crate) fn create(
             //   }
         })
         .font_family(vec![FamilyOwned::Name(String::from("Calamity"))])
-        .row_between(Pixels(4.0))
-        .child_top(Pixels(8.0))
-        .child_bottom(Pixels(8.0));
+        // Rhythm: 8px between stacked rows, 12px inset on top/bottom, 4px
+        // on the sides so rows line up with the window edge through the
+        // inner `child_left` values.
+        .row_between(Pixels(8.0))
+        .child_top(Pixels(12.0))
+        .child_bottom(Pixels(12.0));
     })
 }
 
@@ -149,6 +151,8 @@ fn channel_radio_row(cx: &mut Context) {
         Label::new(cx, "Channel")
             .font_size(11.0)
             .width(Pixels(60.0))
+            // Optical centering: the label's font cap-height visually
+            // aligns with the buttons by stretching space above and below.
             .child_top(Stretch(1.0))
             .child_bottom(Stretch(1.0));
 
@@ -156,9 +160,11 @@ fn channel_radio_row(cx: &mut Context) {
             channel_radio_button(cx, ch);
         }
     })
-    .col_between(Pixels(2.0))
-    .height(Pixels(28.0))
-    .child_left(Pixels(12.0));
+    // 4px between buttons — cleaner rhythm than the previous 2px and
+    // reinforces each button as its own hit target rather than one mass.
+    .col_between(Pixels(4.0))
+    .height(Pixels(32.0))
+    .child_left(Pixels(16.0));
 }
 
 /// One of the 16 channel buttons.
@@ -198,9 +204,15 @@ fn channel_radio_button(cx: &mut Context, ch: u8) {
                 .child_space(Stretch(1.0))
         },
     )
-    // Wider than 22px so two-digit labels ("10".."16") don't clip.
-    .width(Pixels(28.0))
-    .height(Pixels(22.0))
+    // 32×26 → more generous hit area than 28×22 without blowing out the
+    // row width (16 × 32 + 15 × 4 = 572, still inside the 600-wide window).
+    .width(Pixels(32.0))
+    .height(Pixels(26.0))
+    // Concentric radius: buttons sit inside a parent that has no radius,
+    // so the button radius is free to pick up shape on its own. 5px reads
+    // as "pill-ish square" and is consistent with the 6px used on the
+    // larger Reload/Add buttons below (outer = inner + a touch of padding).
+    .border_radius(Pixels(5.0))
     // Selected button gets a distinct fill. `.map(…)` on a lens produces a
     // new lens whose target is the mapped value — so this cell's background
     // automatically re-renders when the channel param changes from any
@@ -224,9 +236,11 @@ fn program_row(cx: &mut Context) {
             ParamSlider::new(cx, Data::params, |p| &p.program).width(Pixels(170.0));
         });
     })
-    .col_between(Pixels(12.0))
-    .height(Pixels(50.0))
-    .child_left(Pixels(12.0));
+    // 16px inner column gap + 16px left inset to match the channel row
+    // and section headers (consistent rhythm down the left edge).
+    .col_between(Pixels(16.0))
+    .height(Pixels(54.0))
+    .child_left(Pixels(16.0));
 }
 
 /// Voicegroup line 1: status text + Reload button.
@@ -292,9 +306,11 @@ where
 fn section_header(cx: &mut Context, title: &str) {
     Label::new(cx, title)
         .font_size(13.0)
-        .height(Pixels(22.0))
-        .child_top(Pixels(6.0))
-        .child_left(Pixels(12.0));
+        // Consistent 28px-tall header row with 10px of top padding —
+        // the label sits with rhythm above the content it labels.
+        .height(Pixels(28.0))
+        .child_top(Pixels(10.0))
+        .child_left(Pixels(16.0));
 }
 
 /// A fixed-row: enable toggle (whose label is the row name) + value slider.
@@ -306,8 +322,10 @@ fn fixed_row(cx: &mut Context, i: usize) {
         ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(370.0));
     })
     .col_between(Pixels(8.0))
-    .height(Pixels(26.0))
-    .child_left(Pixels(12.0));
+    // 28px row height to match the channel row, giving the whole table a
+    // uniform vertical cadence.
+    .height(Pixels(28.0))
+    .child_left(Pixels(16.0));
 }
 
 // -----------------------------------------------------------------------------
