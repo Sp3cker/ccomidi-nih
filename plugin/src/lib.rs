@@ -84,6 +84,34 @@ struct NihSink<'a, C: ProcessContext<CComidiPlugin>> {
     ctx: &'a mut C,
 }
 
+/// Rewrite an event's channel nibble in place.
+///
+/// Every channel-voice MIDI message (note on/off, CC, pitch bend, program
+/// change, channel pressure, poly pressure) gets retargeted. Non-channel
+/// events (tempo, MIDI clock, raw sysex, …) pass through untouched.
+///
+/// `match` covers enum variants structurally — using `|` to share the same
+/// body across shapes that happen to carry the same fields lets the compiler
+/// catch any variant we forget to handle.
+fn retarget_channel<S>(ev: &mut NoteEvent<S>, new_channel: u8) {
+    match ev {
+        NoteEvent::NoteOn { channel, .. }
+        | NoteEvent::NoteOff { channel, .. }
+        | NoteEvent::Choke { channel, .. }
+        | NoteEvent::PolyPressure { channel, .. }
+        | NoteEvent::MidiChannelPressure { channel, .. }
+        | NoteEvent::MidiPitchBend { channel, .. }
+        | NoteEvent::MidiCC { channel, .. }
+        | NoteEvent::MidiProgramChange { channel, .. } => {
+            *channel = new_channel;
+        }
+        // Everything else — timing events, polyphonic-expression voice
+        // terminators, parameter automation, etc. — has no channel to
+        // rewrite. Leave untouched.
+        _ => {}
+    }
+}
+
 impl<'a, C: ProcessContext<CComidiPlugin>> core::EventSink for NihSink<'a, C> {
     fn push_cc(&mut self, timing: u32, channel: u8, cc: u8, value: u8) {
         // nih-plug wants the CC value as a 0.0..=1.0 float; we divide so
@@ -153,15 +181,19 @@ impl Plugin for CComidiPlugin {
         // 1. Reflect host-facing param values into core state. Cheap.
         self.sync_params_to_core();
 
-        // 2. Read transport state once. `playing` flips on the sample that
-        //    the host starts the transport.
+        // 2. Read transport state + target channel once at block start.
+        //    `playing` flips on the sample the host starts the transport.
         let is_playing = context.transport().playing;
+        let target_channel = self.params.channel.value() as u8;
 
-        // 3. Pass-through all input MIDI events (notes, pitch bend, …).
-        //    The C++ ccomidi does the same: SenderCore only emits CCs and
-        //    Program Changes; everything else from the upstream plugin
-        //    flows unchanged.
-        while let Some(ev) = context.next_event() {
+        // 3. Pass-through every input MIDI event, but rewrite its channel
+        //    nibble to the user-selected `target_channel`. Matches the C++
+        //    ccomidi behavior in `src/plugin/ccomidi_plugin.cpp:705-728`:
+        //    notes, pitch bend, CCs and everything else are re-sent on the
+        //    target channel, so this plugin acts as a channel-routing
+        //    stage as well as a CC source.
+        while let Some(mut ev) = context.next_event() {
+            retarget_channel(&mut ev, target_channel);
             context.send_event(ev);
         }
 
