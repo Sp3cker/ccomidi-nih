@@ -6,80 +6,120 @@
 //!   1. Title row
 //!   2. Transport row: MIDI channel, Program-enable toggle, Program number
 //!   3. "Fixed commands" section: Volume / Pan / Mod / LFO Speed (4 rows)
-//!   4. "Dynamic commands" section: 12 freely-assignable rows
+//!   4. "Voicegroup" section: status + Reload, index slider + Add button
+//!   5. (hidden for perf diag) "Dynamic commands": 12 freely-assignable rows
 //!
 //! # Vizia idioms used here
 //!
 //! - `#[derive(Lens)]` on `Data` generates type-safe projectors so the UI
 //!   can observe `params` reactively: `Data::params` is a *lens*, not a
 //!   field access.
-//! - `ParamSlider`/`ParamButton` take the root lens plus a `Fn(&Params)
-//!   -> &Param` closure that picks out one leaf. The closure must be
-//!   `'static + Copy` so we capture `i: usize` by `move` inside each loop.
-//! - Layout is flexbox-ish: `VStack`/`HStack` position children along one
-//!   axis, and `child_*` / `row_between` / `col_between` add padding.
+//! - `ParamSlider` / `ParamButton` take the root lens plus a
+//!   `Fn(&Params) -> &Param` closure that picks out one leaf. The closure
+//!   must be `'static + Copy` so we capture `i: usize` by `move` inside
+//!   each loop.
+//! - Non-param UI state (voicegroup status text) lives in `Data` as a
+//!   plain `String`. It's mutated inside `Model::event` in response to
+//!   `AppEvent`s emitted from button presses.
 
 use nih_plug::prelude::Editor;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 // DYN_ROWS is unused while the dynamic section is hidden, but keep the
 // import commented so re-enabling is a one-line change.
 use crate::params::{CComidiParams, FIXED_ROWS /*, DYN_ROWS */};
+use crate::voicegroup::{self, VoicegroupState};
 
-/// Root Vizia model: everything the widget tree can observe lives here.
+/// Messages the editor fires at itself.
+///
+/// - `ReloadVoicegroup` rereads `poryaaaa_state.json` and refreshes
+///   `Data::vg_status`.
+/// - `EmitAddInstrument` reads the current `add_instrument_index` param
+///   and stores it into the shared `pending_add_instrument` atomic; the
+///   audio thread picks it up on its next block and emits CC#98/#99.
+#[derive(Debug)]
+enum AppEvent {
+    ReloadVoicegroup,
+    EmitAddInstrument,
+}
+
+/// Root Vizia model.
 #[derive(Lens)]
 struct Data {
     params: Arc<CComidiParams>,
+    pending_add_instrument: Arc<AtomicI32>,
+    /// One-line summary for the UI. `String` (rather than the full
+    /// `VoicegroupState`) because Vizia's `Data` trait is already
+    /// implemented for `String` — no manual impl needed.
+    vg_status: String,
 }
 
-impl Model for Data {}
+impl Model for Data {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|app_event: &AppEvent, _| match app_event {
+            AppEvent::ReloadVoicegroup => {
+                self.vg_status = format_status(&load_voicegroup());
+            }
+            AppEvent::EmitAddInstrument => {
+                let idx = self.params.add_instrument_index.value();
+                // `Release` pairs with the audio thread's `AcqRel` swap;
+                // nothing on the UI side needs synchronizing *before* this
+                // store, so a plain release is enough.
+                self.pending_add_instrument.store(idx, Ordering::Release);
+            }
+        });
+    }
+}
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // With the dynamic section hidden, 360px of height covers title +
-    // transport + 4 fixed rows comfortably. Halving the window drops
-    // retina pixel-fill cost from ~2.5M to ~1.2M pixels.
-    ViziaState::new(|| (820, 360))
+    // 1.25 user scale carries over from the fixed-only window; logical
+    // size bumped to accommodate the voicegroup section.
+    ViziaState::new_with_default_scale_factor(|| (520, 320), 1.25)
 }
 
 pub(crate) fn create(
     params: Arc<CComidiParams>,
     editor_state: Arc<ViziaState>,
+    pending_add_instrument: Arc<AtomicI32>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
         cx.add_font_mem(include_bytes!("../Calamity-Regular.otf"));
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
 
+        // Synchronous initial load so the status line shows something
+        // useful before the user touches Reload.
+        let initial_status = format_status(&load_voicegroup());
+
         Data {
             params: params.clone(),
+            pending_add_instrument: pending_add_instrument.clone(),
+            vg_status: initial_status,
         }
         .build(cx);
 
         VStack::new(cx, |cx| {
-            // -- title ----------------------------------------------------
             Label::new(cx, "ccomidi")
-                .font_size(28.0)
-                .height(Pixels(44.0))
+                .font_size(24.0)
+                .height(Pixels(36.0))
                 .child_space(Stretch(1.0));
 
-            // -- transport row --------------------------------------------
             transport_row(cx);
 
-            // -- fixed commands -------------------------------------------
             section_header(cx, "Fixed commands");
             for i in 0..FIXED_ROWS {
                 fixed_row(cx, i);
             }
 
-            // -- dynamic commands -----------------------------------------
-            // Temporarily hidden while we diagnose GUI lag. 12 rows × 7
-            // widgets each = 84 widgets and ~60 numeric labels rasterized
-            // per frame — the biggest scene-graph contributor by far.
-            // Params still exist and automate; the row logic still runs in
-            // `sync_params_to_core`. Only the UI is suppressed.
+            section_header(cx, "Voicegroup");
+            voicegroup_row(cx);
+            add_instrument_row(cx);
+
+            // Dynamic commands section hidden while diagnosing GUI lag:
             //
             //   section_header(cx, "Dynamic commands");
             //   dynamic_header(cx);
@@ -94,25 +134,72 @@ pub(crate) fn create(
     })
 }
 
-/// Channel + Program-enable + Program, all in one row.
+/// Channel + Program-enable + Program in a single row.
 fn transport_row(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        labeled_control(cx, "Channel", 140.0, |cx| {
-            ParamSlider::new(cx, Data::params, |p| &p.channel).width(Pixels(120.0));
+        labeled_control(cx, "Channel", 100.0, |cx| {
+            ParamSlider::new(cx, Data::params, |p| &p.channel).width(Pixels(90.0));
         });
-        labeled_control(cx, "Program Enable", 140.0, |cx| {
+        labeled_control(cx, "Program On", 90.0, |cx| {
             ParamButton::new(cx, Data::params, |p| &p.program_enabled);
         });
-        labeled_control(cx, "Program", 200.0, |cx| {
-            ParamSlider::new(cx, Data::params, |p| &p.program).width(Pixels(180.0));
+        labeled_control(cx, "Program", 180.0, |cx| {
+            ParamSlider::new(cx, Data::params, |p| &p.program).width(Pixels(170.0));
         });
     })
-    .col_between(Pixels(20.0))
-    .height(Pixels(62.0))
-    .child_left(Pixels(16.0));
+    .col_between(Pixels(12.0))
+    .height(Pixels(54.0))
+    .child_left(Pixels(12.0));
 }
 
-/// Small layout helper: a column with a caption above the actual control.
+/// Voicegroup line 1: status text + Reload button.
+fn voicegroup_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        // `Label::new(cx, Data::vg_status)` subscribes the label to the
+        // lens; any `self.vg_status = …` in `Model::event` auto-updates
+        // the displayed text.
+        Label::new(cx, Data::vg_status)
+            .font_size(11.0)
+            .width(Pixels(380.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        Button::new(
+            cx,
+            |cx| cx.emit(AppEvent::ReloadVoicegroup),
+            |cx| Label::new(cx, "Reload"),
+        )
+        .width(Pixels(80.0));
+    })
+    .col_between(Pixels(8.0))
+    .height(Pixels(26.0))
+    .child_left(Pixels(12.0));
+}
+
+/// Voicegroup line 2: index slider + Add Instrument button.
+fn add_instrument_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, "Add Instrument #")
+            .font_size(11.0)
+            .width(Pixels(130.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        ParamSlider::new(cx, Data::params, |p| &p.add_instrument_index).width(Pixels(260.0));
+
+        Button::new(
+            cx,
+            |cx| cx.emit(AppEvent::EmitAddInstrument),
+            |cx| Label::new(cx, "Add"),
+        )
+        .width(Pixels(70.0));
+    })
+    .col_between(Pixels(8.0))
+    .height(Pixels(26.0))
+    .child_left(Pixels(12.0));
+}
+
+/// Small layout helper: caption above a control.
 fn labeled_control<F>(cx: &mut Context, label: &str, width: f32, content: F)
 where
     F: FnOnce(&mut Context),
@@ -127,29 +214,63 @@ where
 
 fn section_header(cx: &mut Context, title: &str) {
     Label::new(cx, title)
-        .font_size(14.0)
-        .height(Pixels(28.0))
-        .child_top(Pixels(8.0))
-        .child_left(Pixels(16.0));
+        .font_size(13.0)
+        .height(Pixels(22.0))
+        .child_top(Pixels(6.0))
+        .child_left(Pixels(12.0));
 }
 
-/// A fixed-row: enable toggle (showing the row's name) + value slider.
-///
-/// The toggle's *display name* is the row name ("Volume", "Pan", …), so the
-/// button doubles as both label and control — no separate `Label` needed.
+/// A fixed-row: enable toggle (whose label is the row name) + value slider.
 fn fixed_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
         ParamButton::new(cx, Data::params, move |p| &p.fixed_rows[i].enabled)
-            .width(Pixels(140.0));
+            .width(Pixels(110.0));
 
-        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(580.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(370.0));
     })
-    .col_between(Pixels(10.0))
-    .height(Pixels(28.0))
-    .child_left(Pixels(16.0));
+    .col_between(Pixels(8.0))
+    .height(Pixels(26.0))
+    .child_left(Pixels(12.0));
 }
 
-/// Column captions for the dynamic table, shown once above row 0.
+// -----------------------------------------------------------------------------
+// Helpers used by Model::event — keep I/O-capable ones on the UI thread only.
+// -----------------------------------------------------------------------------
+
+fn load_voicegroup() -> VoicegroupState {
+    match voicegroup::resolve_state_path() {
+        Some(path) => voicegroup::load_state(&path),
+        None => VoicegroupState {
+            error: Some("could not locate plugin bundle".into()),
+            ..Default::default()
+        },
+    }
+}
+
+/// Condense the loaded state into a one-line status message. Errors win
+/// over success info so misconfiguration stands out.
+fn format_status(state: &VoicegroupState) -> String {
+    if let Some(err) = &state.error {
+        if state.available_instruments.is_empty() {
+            return format!("⚠ {err}");
+        }
+        return format!(
+            "⚠ {}  ({} instruments available)",
+            err,
+            state.available_instruments.len()
+        );
+    }
+    format!(
+        "{} slots · {} instruments available",
+        state.slots.len(),
+        state.available_instruments.len()
+    )
+}
+
+// -----------------------------------------------------------------------------
+// Dynamic row helpers — hidden while diagnosing lag, kept to re-enable easily.
+// -----------------------------------------------------------------------------
+
 #[allow(dead_code)]
 fn dynamic_header(cx: &mut Context) {
     HStack::new(cx, |cx| {
@@ -164,18 +285,12 @@ fn dynamic_header(cx: &mut Context) {
     .child_left(Pixels(16.0));
 }
 
-/// A dynamic row: enable toggle (labeled with its row number) + command
-/// picker + four field sliders.
 #[allow(dead_code)]
 fn dynamic_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
-        // Toggle's display-name is "Row N" — wide enough to fit "Row 15".
         ParamButton::new(cx, Data::params, move |p| &p.dyn_rows[i].enabled)
             .width(Pixels(100.0));
-
-        // ParamSlider over an EnumParam renders as a cycling selector.
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].cmd).width(Pixels(200.0));
-
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f0).width(Pixels(96.0));
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f1).width(Pixels(96.0));
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f2).width(Pixels(96.0));

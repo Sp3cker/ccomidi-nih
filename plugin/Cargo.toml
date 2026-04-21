@@ -14,3 +14,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }
 nih_plug_vizia = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+
+# Voicegroup bridge: parse poryaaaa_state.json
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Voicegroup bridge: locate our own .clap bundle on disk via dladdr(3).
+# Needed because the DAW loads us as a dylib and `current_exe()` points
+# at the DAW, not at us.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -575,8 +575,11 @@ dependencies = [
 name = "ccomidi-nih"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nih_plug",
  "nih_plug_vizia",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

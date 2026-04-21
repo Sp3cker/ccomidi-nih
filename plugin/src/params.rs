@@ -194,6 +194,13 @@ pub struct CComidiParams {
     #[id = "p"]
     pub program: IntParam,
 
+    /// 14-bit index of the next instrument to append to the voicegroup.
+    /// Range 0..=16383 (CC#98 LSB + CC#99 MSB). Clicking the "Add
+    /// Instrument" button in the editor reads this value and writes it
+    /// to the plugin's `pending_add_instrument` atomic.
+    #[id = "ai"]
+    pub add_instrument_index: IntParam,
+
     /// 4 fixed rows. Cross-array id collisions are prevented at the inner
     /// `#[id]` level: FixedRowParams uses `fxen`/`fxv`, DynamicRowParams
     /// uses `dyen`/`dyc`/…, so the resulting fully-qualified ids (e.g.
@@ -215,6 +222,15 @@ impl Default for CComidiParams {
 
             program_enabled: BoolParam::new("Program On", false),
             program: IntParam::new("Program", 0, IntRange::Linear { min: 0, max: 127 }),
+
+            add_instrument_index: IntParam::new(
+                "Add Instrument Index",
+                0,
+                IntRange::Linear {
+                    min: 0,
+                    max: crate::voicegroup::MAX_INSTRUMENT_INDEX as i32,
+                },
+            ),
 
             fixed_rows: [
                 FixedRowParams::new("Volume"),
