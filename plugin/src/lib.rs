@@ -1,45 +1,107 @@
 use nih_plug::prelude::*;
-use nih_plug_vizia::ViziaState;
 use std::sync::Arc;
 
-// Framework-agnostic MIDI command logic (ported from the C++ ccomidi project).
-// Not yet wired into `process` — that happens in a later pass once we design
-// the nih-plug parameter layout. Kept in the tree so `cargo test` exercises
-// it and the build keeps it honest.
-//
-// `dead_code` + `unused_imports` are expected until phase 2 hooks this up.
-#[allow(dead_code, unused_imports)]
+// Some `SenderCore` helpers (getters, `reset`, etc.) are legitimate public
+// API that the plugin doesn't currently call — they'll be used once we
+// implement diff-on-param-change emission.
+#[allow(dead_code)]
 mod core;
-
 mod editor;
+mod params;
+
+use params::CComidiParams;
 
 pub struct CComidiPlugin {
+    /// Host-synchronized parameter block (see `params.rs`). `Arc` because
+    /// the editor thread and audio thread both hold a handle; nih-plug's
+    /// params use atomics internally so shared read/write is safe.
     params: Arc<CComidiParams>,
-}
 
-#[derive(Params)]
-pub struct CComidiParams {
-    #[persist = "editor-state"]
-    editor_state: Arc<ViziaState>,
-
-    #[id = "passthrough"]
-    pub passthrough: BoolParam,
+    /// Framework-agnostic emission engine. Owned by the plugin because it
+    /// carries mutable per-block state (last-transport-playing, etc.) that
+    /// only the audio thread touches.
+    sender: core::SenderCore,
 }
 
 impl Default for CComidiPlugin {
     fn default() -> Self {
         Self {
             params: Arc::new(CComidiParams::default()),
+            sender: core::SenderCore::new(),
         }
     }
 }
 
-impl Default for CComidiParams {
-    fn default() -> Self {
-        Self {
-            editor_state: editor::default_state(),
-            passthrough: BoolParam::new("MIDI Passthrough", true),
+impl CComidiPlugin {
+    /// Copy current nih-plug parameter values into [`core::SenderCore`]
+    /// state. Called once per audio block, before we tick the sender.
+    ///
+    /// # Why a sync step instead of reading params from inside core?
+    ///
+    /// Keeping core free of nih-plug types means unit tests don't need the
+    /// whole plugin infrastructure. The "cost" is this plain-data copy —
+    /// but every setter is a no-op if the value didn't change, and the
+    /// entire block (3 + 4*2 + 12*6 = 83 setter calls) is stack-only work
+    /// measured in nanoseconds.
+    fn sync_params_to_core(&mut self) {
+        let p = &*self.params;
+
+        self.sender.set_channel(p.channel.value() as u8);
+        self.sender.set_program(p.program.value() as u8);
+        self.sender.set_program_enabled(p.program_enabled.value());
+
+        // Fixed rows: only value[0] is meaningful.
+        for i in 0..params::FIXED_ROWS {
+            let r = &p.fixed_rows[i];
+            self.sender.set_row_enabled(i, r.enabled.value());
+            self.sender.set_row_field(i, 0, r.value.value() as u8);
         }
+
+        // Dynamic rows: cmd + four fields.
+        for i in 0..params::DYN_ROWS {
+            let r = &p.dyn_rows[i];
+            let row_idx = params::FIXED_ROWS + i;
+            self.sender.set_row_enabled(row_idx, r.enabled.value());
+            self.sender.set_row_cmd(row_idx, r.cmd.value().into());
+            self.sender.set_row_field(row_idx, 0, r.f0.value() as u8);
+            self.sender.set_row_field(row_idx, 1, r.f1.value() as u8);
+            self.sender.set_row_field(row_idx, 2, r.f2.value() as u8);
+            self.sender.set_row_field(row_idx, 3, r.f3.value() as u8);
+        }
+    }
+}
+
+/// Adapter that lets [`core::SenderCore`] write events into nih-plug's
+/// per-block `ProcessContext` without core itself depending on nih-plug.
+///
+/// # Lifetime / generics, briefly
+///
+/// `'a` is the lifetime of the borrow into the context, and `C` is the
+/// concrete context type the host gave us this block. Because we implement
+/// the trait generically over `C`, the compiler monomorphizes one copy per
+/// host (CLAP, VST3, standalone), so dispatch is a direct call — no vtable.
+struct NihSink<'a, C: ProcessContext<CComidiPlugin>> {
+    ctx: &'a mut C,
+}
+
+impl<'a, C: ProcessContext<CComidiPlugin>> core::EventSink for NihSink<'a, C> {
+    fn push_cc(&mut self, timing: u32, channel: u8, cc: u8, value: u8) {
+        // nih-plug wants the CC value as a 0.0..=1.0 float; we divide so
+        // that `127 / 127` round-trips losslessly for any integer 0..=127.
+        self.ctx.send_event(NoteEvent::MidiCC {
+            timing,
+            channel,
+            cc,
+            value: value as f32 / 127.0,
+        });
+    }
+
+    fn push_program(&mut self, timing: u32, channel: u8, program: u8) {
+        self.ctx.send_event(NoteEvent::MidiProgramChange {
+            timing,
+            channel,
+            program,
+        });
     }
 }
 
@@ -50,7 +112,7 @@ impl Plugin for CComidiPlugin {
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    // MIDI-only plugin: no audio channels required.
+    // MIDI-only: we have no audio channels at all.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
         main_input_channels: None,
         main_output_channels: None,
@@ -74,18 +136,40 @@ impl Plugin for CComidiPlugin {
         editor::create(self.params.clone(), self.params.editor_state.clone())
     }
 
+    /// Called by the host every time the plugin is (re-)activated. We clear
+    /// the sender's *runtime* state (last-emitted caches etc.) so the next
+    /// play-start triggers a fresh snapshot, while keeping the user's row
+    /// configuration intact.
+    fn reset(&mut self) {
+        self.sender.reset_runtime();
+    }
+
     fn process(
         &mut self,
         _buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        let passthrough = self.params.passthrough.value();
-        while let Some(event) = context.next_event() {
-            if passthrough {
-                context.send_event(event);
-            }
+        // 1. Reflect host-facing param values into core state. Cheap.
+        self.sync_params_to_core();
+
+        // 2. Read transport state once. `playing` flips on the sample that
+        //    the host starts the transport.
+        let is_playing = context.transport().playing;
+
+        // 3. Pass-through all input MIDI events (notes, pitch bend, …).
+        //    The C++ ccomidi does the same: SenderCore only emits CCs and
+        //    Program Changes; everything else from the upstream plugin
+        //    flows unchanged.
+        while let Some(ev) = context.next_event() {
+            context.send_event(ev);
         }
+
+        // 4. Now tick the sender. Borrows `context` mutably via NihSink —
+        //    which is why the pass-through loop above had to run first.
+        let mut sink = NihSink { ctx: context };
+        self.sender.tick(is_playing, &mut sink);
+
         ProcessStatus::Normal
     }
 }
