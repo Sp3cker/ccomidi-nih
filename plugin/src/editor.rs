@@ -27,9 +27,6 @@ use std::sync::Arc;
 
 use crate::params::{CComidiParams, DYN_ROWS, FIXED_ROWS};
 
-/// Labels for the four fixed rows. Indexed 0..FIXED_ROWS.
-const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = ["Volume", "Pan", "Mod", "LFO Speed"];
-
 /// Root Vizia model: everything the widget tree can observe lives here.
 #[derive(Lens)]
 struct Data {
@@ -125,18 +122,16 @@ fn section_header(cx: &mut Context, title: &str) {
         .child_left(Pixels(16.0));
 }
 
-/// A fixed-row: enable toggle + command label + single value slider.
+/// A fixed-row: enable toggle (showing the row's name) + value slider.
+///
+/// The toggle's *display name* is the row name ("Volume", "Pan", …), so the
+/// button doubles as both label and control — no separate `Label` needed.
 fn fixed_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
-        ParamButton::new(cx, Data::params, move |p| &p.fixed_rows[i].enabled).width(Pixels(60.0));
+        ParamButton::new(cx, Data::params, move |p| &p.fixed_rows[i].enabled)
+            .width(Pixels(140.0));
 
-        Label::new(cx, FIXED_ROW_LABELS[i])
-            .font_size(12.0)
-            .width(Pixels(120.0))
-            .child_top(Stretch(1.0))
-            .child_bottom(Stretch(1.0));
-
-        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(560.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.fixed_rows[i].value).width(Pixels(580.0));
     })
     .col_between(Pixels(10.0))
     .height(Pixels(28.0))
@@ -146,8 +141,8 @@ fn fixed_row(cx: &mut Context, i: usize) {
 /// Column captions for the dynamic table, shown once above row 0.
 fn dynamic_header(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        Label::new(cx, "On").font_size(10.0).width(Pixels(60.0));
-        Label::new(cx, "Command").font_size(10.0).width(Pixels(220.0));
+        Label::new(cx, "Row").font_size(10.0).width(Pixels(100.0));
+        Label::new(cx, "Command").font_size(10.0).width(Pixels(200.0));
         for field in ["f0", "f1", "f2", "f3"] {
             Label::new(cx, field).font_size(10.0).width(Pixels(96.0));
         }
@@ -157,13 +152,16 @@ fn dynamic_header(cx: &mut Context) {
     .child_left(Pixels(16.0));
 }
 
-/// A dynamic row: enable + command dropdown + four field sliders.
+/// A dynamic row: enable toggle (labeled with its row number) + command
+/// picker + four field sliders.
 fn dynamic_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
-        ParamButton::new(cx, Data::params, move |p| &p.dyn_rows[i].enabled).width(Pixels(60.0));
+        // Toggle's display-name is "Row N" — wide enough to fit "Row 15".
+        ParamButton::new(cx, Data::params, move |p| &p.dyn_rows[i].enabled)
+            .width(Pixels(100.0));
 
         // ParamSlider over an EnumParam renders as a cycling selector.
-        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].cmd).width(Pixels(220.0));
+        ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].cmd).width(Pixels(200.0));
 
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f0).width(Pixels(96.0));
         ParamSlider::new(cx, Data::params, move |p| &p.dyn_rows[i].f1).width(Pixels(96.0));

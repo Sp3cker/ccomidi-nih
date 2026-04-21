@@ -93,17 +93,26 @@ impl From<AssignableCommand> for CommandType {
 /// only confuse the user.
 #[derive(Params)]
 pub struct FixedRowParams {
-    #[id = "en"]
+    // Leaf ids are prefixed `fx` so they don't collide with `DynamicRowParams`
+    // when both are used via `#[nested(array, …)]` on the top-level struct —
+    // the array form auto-prefixes by index only, not by field name.
+    #[id = "fxen"]
     pub enabled: BoolParam,
-    #[id = "v"]
+    #[id = "fxv"]
     pub value: IntParam,
 }
 
 impl FixedRowParams {
     fn new(label: &str) -> Self {
         Self {
-            enabled: BoolParam::new(format!("{label} On"), false),
-            value: IntParam::new(label, 0, IntRange::Linear { min: 0, max: 127 }),
+            // Short display-name so the button widget doesn't overflow:
+            // just the row name itself. The toggle state IS the "on" signal.
+            enabled: BoolParam::new(label, false),
+            value: IntParam::new(
+                format!("{label} Value"),
+                0,
+                IntRange::Linear { min: 0, max: 127 },
+            ),
         }
     }
 }
@@ -114,17 +123,19 @@ impl FixedRowParams {
 /// all four. Commands that use fewer simply ignore the extras.
 #[derive(Params)]
 pub struct DynamicRowParams {
-    #[id = "en"]
+    // See note on `FixedRowParams` — ids are prefixed `dy` to stay unique
+    // across both arrays.
+    #[id = "dyen"]
     pub enabled: BoolParam,
-    #[id = "c"]
+    #[id = "dyc"]
     pub cmd: EnumParam<AssignableCommand>,
-    #[id = "f0"]
+    #[id = "dyf0"]
     pub f0: IntParam,
-    #[id = "f1"]
+    #[id = "dyf1"]
     pub f1: IntParam,
-    #[id = "f2"]
+    #[id = "dyf2"]
     pub f2: IntParam,
-    #[id = "f3"]
+    #[id = "dyf3"]
     pub f3: IntParam,
 }
 
@@ -141,7 +152,8 @@ impl DynamicRowParams {
             )
         };
         Self {
-            enabled: BoolParam::new(format!("{label} On"), false),
+            // Short display-name so the button fits: just "Row N".
+            enabled: BoolParam::new(&label, false),
             cmd: EnumParam::new(format!("{label} Cmd"), AssignableCommand::None),
             f0: field(0),
             f1: field(1),
@@ -182,7 +194,10 @@ pub struct CComidiParams {
     #[id = "p"]
     pub program: IntParam,
 
-    /// 4 fixed rows. `#[nested(array, …)]` auto-generates ids per element.
+    /// 4 fixed rows. Cross-array id collisions are prevented at the inner
+    /// `#[id]` level: FixedRowParams uses `fxen`/`fxv`, DynamicRowParams
+    /// uses `dyen`/`dyc`/…, so the resulting fully-qualified ids (e.g.
+    /// `0_fxen`, `0_dyen`) stay unique.
     #[nested(array, group = "Fixed")]
     pub fixed_rows: [FixedRowParams; FIXED_ROWS],
 
