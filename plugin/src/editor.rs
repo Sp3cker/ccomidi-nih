@@ -25,7 +25,9 @@ use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::Arc;
 
-use crate::params::{CComidiParams, DYN_ROWS, FIXED_ROWS};
+// DYN_ROWS is unused while the dynamic section is hidden, but keep the
+// import commented so re-enabling is a one-line change.
+use crate::params::{CComidiParams, FIXED_ROWS /*, DYN_ROWS */};
 
 /// Root Vizia model: everything the widget tree can observe lives here.
 #[derive(Lens)]
@@ -36,9 +38,10 @@ struct Data {
 impl Model for Data {}
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // Wide enough for four field sliders side-by-side on a dynamic row,
-    // tall enough to show all 12 dynamic rows without scrolling.
-    ViziaState::new(|| (820, 760))
+    // With the dynamic section hidden, 360px of height covers title +
+    // transport + 4 fixed rows comfortably. Halving the window drops
+    // retina pixel-fill cost from ~2.5M to ~1.2M pixels.
+    ViziaState::new(|| (820, 360))
 }
 
 pub(crate) fn create(
@@ -46,6 +49,7 @@ pub(crate) fn create(
     editor_state: Arc<ViziaState>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
+        cx.add_font_mem(include_bytes!("../Calamity-Regular.otf"));
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
 
@@ -71,12 +75,19 @@ pub(crate) fn create(
             }
 
             // -- dynamic commands -----------------------------------------
-            section_header(cx, "Dynamic commands");
-            dynamic_header(cx);
-            for i in 0..DYN_ROWS {
-                dynamic_row(cx, i);
-            }
+            // Temporarily hidden while we diagnose GUI lag. 12 rows × 7
+            // widgets each = 84 widgets and ~60 numeric labels rasterized
+            // per frame — the biggest scene-graph contributor by far.
+            // Params still exist and automate; the row logic still runs in
+            // `sync_params_to_core`. Only the UI is suppressed.
+            //
+            //   section_header(cx, "Dynamic commands");
+            //   dynamic_header(cx);
+            //   for i in 0..DYN_ROWS {
+            //       dynamic_row(cx, i);
+            //   }
         })
+        .font_family(vec![FamilyOwned::Name(String::from("Calamity"))])
         .row_between(Pixels(4.0))
         .child_top(Pixels(8.0))
         .child_bottom(Pixels(8.0));
@@ -139,6 +150,7 @@ fn fixed_row(cx: &mut Context, i: usize) {
 }
 
 /// Column captions for the dynamic table, shown once above row 0.
+#[allow(dead_code)]
 fn dynamic_header(cx: &mut Context) {
     HStack::new(cx, |cx| {
         Label::new(cx, "Row").font_size(10.0).width(Pixels(100.0));
@@ -154,6 +166,7 @@ fn dynamic_header(cx: &mut Context) {
 
 /// A dynamic row: enable toggle (labeled with its row number) + command
 /// picker + four field sliders.
+#[allow(dead_code)]
 fn dynamic_row(cx: &mut Context, i: usize) {
     HStack::new(cx, |cx| {
         // Toggle's display-name is "Row N" — wide enough to fit "Row 15".
