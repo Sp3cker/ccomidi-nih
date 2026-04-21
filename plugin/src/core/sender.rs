@@ -93,14 +93,16 @@ pub struct SenderCore {
     rows: [RowState; MAX_ROWS],
 
     // ---- Runtime tracking (NOT persisted) ------------------------------
-    // These exist only to decide "should we emit a snapshot right now?"
-    // and to let a future diff-emission pass skip redundant CC writes.
+    // These exist only to drive the diff-emission path so that we don't
+    // re-send identical bytes every block.
     last_transport_playing: bool,
-    last_emitted_channel: u8,
+    /// `None` = "no prior emission / caches invalidated"; a value means
+    /// "last emit used this channel". Any mismatch forces a full re-emit
+    /// because every CC / PC's status byte carries the channel nibble.
+    last_emitted_channel: Option<u8>,
     last_emitted_program: Option<u8>,
-    /// Last CC sequence we emitted per row. `None` means "never emitted" or
-    /// "last emission was empty" — both are treated as "a re-emit will
-    /// differ" by the future diff path.
+    /// Last CC sequence emitted per row. `None` means "row was disabled or
+    /// never emitted" — either way, the next enabled emission differs.
     last_emitted_rows: [Option<EncodedCommand>; MAX_ROWS],
 }
 
@@ -120,7 +122,7 @@ impl SenderCore {
             program_enabled: false,
             rows: [RowState::default(); MAX_ROWS],
             last_transport_playing: false,
-            last_emitted_channel: 0,
+            last_emitted_channel: None,
             last_emitted_program: None,
             last_emitted_rows: [None; MAX_ROWS],
         }
@@ -137,10 +139,15 @@ impl SenderCore {
     /// so we don't think we "already emitted" things from a stale run.
     pub fn reset_runtime(&mut self) {
         self.last_transport_playing = false;
+        self.invalidate_caches();
+    }
+
+    /// Mark every last-emitted cache as stale. The next [`Self::emit_diff`]
+    /// will produce a full snapshot.
+    fn invalidate_caches(&mut self) {
+        self.last_emitted_channel = None;
         self.last_emitted_program = None;
         self.last_emitted_rows = [None; MAX_ROWS];
-        // `last_emitted_channel` is harmless stale; resynchronized at next
-        // snapshot.
     }
 
     // ---- Setters --------------------------------------------------------
@@ -212,58 +219,97 @@ impl SenderCore {
 
     // ---- Audio-thread entry point --------------------------------------
 
-    /// Per-block tick: detect the transport play-start edge and emit a
-    /// snapshot of all currently-enabled rows when we see it.
+    /// Per-block tick:
+    /// - stopped → nothing emitted
+    /// - just-started (rising edge of `is_playing`) → cache is invalidated,
+    ///   so the diff below emits a full snapshot
+    /// - continuously playing → emit only the rows / program whose bytes
+    ///   differ from the last emission (the "automation-works" path)
     ///
-    /// Call this once per audio block, before draining any per-event
-    /// processing.
+    /// Call this once per audio block, after syncing current parameter
+    /// values into SenderCore state and after draining input MIDI events.
     pub fn tick<S: EventSink>(&mut self, is_playing: bool, sink: &mut S) {
         let just_started = is_playing && !self.last_transport_playing;
         self.last_transport_playing = is_playing;
 
-        if just_started {
-            self.emit_snapshot(sink, 0);
+        if !is_playing {
+            return;
         }
+
+        if just_started {
+            self.invalidate_caches();
+        }
+
+        self.emit_diff(sink, 0);
     }
 
-    /// Emit everything the plugin should send "right now": program change
-    /// (if enabled), then each enabled row's CC sequence.
-    ///
-    /// Exposed publicly so tests and future diff code can call it directly;
-    /// the normal production path goes through [`Self::tick`].
+    /// Force a complete re-emission of every enabled row + program change
+    /// at `timing`. Invalidates caches first so nothing is suppressed as
+    /// "already emitted". Useful for tests and for explicit resync paths.
     pub fn emit_snapshot<S: EventSink>(&mut self, sink: &mut S, timing: u32) {
-        let channel = self.channel;
+        self.invalidate_caches();
+        self.emit_diff(sink, timing);
+    }
 
-        if self.program_enabled {
-            sink.push_program(timing, channel, self.program);
-            self.last_emitted_program = Some(self.program);
-        } else {
+    /// Emit only what has changed since the last emission.
+    ///
+    /// The algorithm:
+    ///  1. If the channel changed, every cached encoding is implicitly
+    ///     stale (status byte differs), so we wipe the row/program caches
+    ///     before doing the per-row comparison — effectively a full resend.
+    ///  2. Program change: compare the "desired PC" (Some when enabled,
+    ///     None when disabled) to the cached last-emitted. Emit on change.
+    ///  3. For each of the 16 rows, encode the desired CC sequence (or
+    ///     `None` if the row is disabled) and compare byte-for-byte to
+    ///     the cached last emission. Emit on difference; update the cache
+    ///     either way.
+    ///
+    /// This is the method that makes host-side parameter automation
+    /// actually produce MIDI during playback — every `process()` block
+    /// calls this, and any slider the user (or host) moved mid-block
+    /// shows up on the wire within one audio block.
+    pub fn emit_diff<S: EventSink>(&mut self, sink: &mut S, timing: u32) {
+        // Channel change ⇒ full re-emit.
+        if self.last_emitted_channel != Some(self.channel) {
             self.last_emitted_program = None;
+            self.last_emitted_rows = [None; MAX_ROWS];
+        }
+        let channel = self.channel;
+        self.last_emitted_channel = Some(channel);
+
+        // Program change diff.
+        let pc_target = if self.program_enabled {
+            Some(self.program)
+        } else {
+            None
+        };
+        if pc_target != self.last_emitted_program {
+            // Only emit when we have a program to send; "disable" can't
+            // undo a prior PC on the wire, we just stop pushing.
+            if let Some(p) = pc_target {
+                sink.push_program(timing, channel, p);
+            }
+            self.last_emitted_program = pc_target;
         }
 
+        // Per-row diff.
         for row_idx in 0..MAX_ROWS {
-            // Index by i to cheaply grab the row without borrowing all of
-            // `self.rows` — lets us still call methods on `self` above if
-            // we want (we don't yet, but the pattern is future-proof).
             let row = &self.rows[row_idx];
-
-            if !row.enabled {
-                self.last_emitted_rows[row_idx] = None;
-                continue;
+            let desired: Option<EncodedCommand> = if row.enabled {
+                let cmd = CommandType::fixed_for_row(row_idx).unwrap_or(row.cmd);
+                Some(encode_row(cmd, &row.fields))
+            } else {
+                None
+            };
+            if desired != self.last_emitted_rows[row_idx] {
+                if let Some(ref enc) = desired {
+                    for msg in enc.as_slice() {
+                        sink.push_cc(timing, channel, msg.cc, msg.value);
+                    }
+                }
+                self.last_emitted_rows[row_idx] = desired;
             }
-
-            let cmd = CommandType::fixed_for_row(row_idx).unwrap_or(row.cmd);
-            let encoded = encode_row(cmd, &row.fields);
-
-            for msg in encoded.as_slice() {
-                sink.push_cc(timing, channel, msg.cc, msg.value);
-            }
-            // Cache for the future diff path: next change to this row can
-            // be skipped if it re-encodes to the same bytes.
-            self.last_emitted_rows[row_idx] = Some(encoded);
         }
-
-        self.last_emitted_channel = channel;
     }
 }
 
@@ -462,6 +508,126 @@ mod tests {
         assert_eq!(core.program(), 0);
         assert!(!core.program_enabled());
         assert!(!core.row(0).unwrap().enabled);
+    }
+
+    // ---- Automation / diff-emit behavior -----------------------------------
+
+    #[test]
+    fn diff_emits_row_change_during_playback() {
+        let mut core = SenderCore::new();
+        core.set_row_enabled(0, true);
+        core.set_row_field(0, 0, 50);
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // play start: emits CC#07=50
+        sink.0.clear();
+
+        // Simulate host automation: volume moves to 90 mid-playback.
+        core.set_row_field(0, 0, 90);
+        core.tick(true, &mut sink); // still playing, but row bytes differ
+
+        assert_eq!(sink.0, vec![cc(0, 0, 0x07, 90)]);
+    }
+
+    #[test]
+    fn diff_emits_program_change_when_enabled_mid_play() {
+        let mut core = SenderCore::new();
+        core.set_program(77);
+        // Program disabled to start.
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // nothing enabled → nothing emitted
+        assert!(sink.0.is_empty());
+
+        // Host automates Program Enable → on.
+        core.set_program_enabled(true);
+        core.tick(true, &mut sink);
+        assert_eq!(sink.0, vec![pc(0, 0, 77)]);
+    }
+
+    #[test]
+    fn diff_does_not_repeat_unchanged_rows() {
+        let mut core = SenderCore::new();
+        core.set_row_enabled(0, true);
+        core.set_row_field(0, 0, 64);
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // edge: emit
+        let n = sink.0.len();
+        core.tick(true, &mut sink); // unchanged: nothing more
+        core.tick(true, &mut sink); // still unchanged
+        assert_eq!(sink.0.len(), n);
+    }
+
+    #[test]
+    fn diff_re_emits_everything_on_channel_change() {
+        let mut core = SenderCore::new();
+        core.set_channel(2);
+        core.set_row_enabled(0, true);
+        core.set_row_field(0, 0, 50);
+        core.set_row_enabled(5, true);
+        core.set_row_cmd(5, CommandType::BendRange);
+        core.set_row_field(5, 0, 12);
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // emit everything on ch 2
+        sink.0.clear();
+
+        // Automate channel change 2 → 9.
+        core.set_channel(9);
+        core.tick(true, &mut sink);
+
+        // Both previously-emitted rows must re-emit, now on ch 9.
+        assert_eq!(
+            sink.0,
+            vec![
+                cc(0, 9, 0x07, 50),  // Volume row
+                cc(0, 9, 0x14, 12),  // BendRange on dynamic row 5
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_disabling_a_row_stops_future_emits_without_flushing() {
+        let mut core = SenderCore::new();
+        core.set_row_enabled(0, true);
+        core.set_row_field(0, 0, 100);
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // emit CC#07=100
+        sink.0.clear();
+
+        core.set_row_enabled(0, false);
+        core.tick(true, &mut sink);
+        // Cache updates to None but nothing new on the wire — you can't
+        // un-emit a CC anyway.
+        assert!(sink.0.is_empty());
+
+        // Re-enabling the row should emit again (even with same value)
+        // because the cache was flipped to None on disable.
+        core.set_row_enabled(0, true);
+        core.tick(true, &mut sink);
+        assert_eq!(sink.0, vec![cc(0, 0, 0x07, 100)]);
+    }
+
+    #[test]
+    fn diff_program_enable_toggle_off_stops_future_pc() {
+        let mut core = SenderCore::new();
+        core.set_program(33);
+        core.set_program_enabled(true);
+
+        let mut sink = RecordingSink::default();
+        core.tick(true, &mut sink); // emits PC 33
+        sink.0.clear();
+
+        core.set_program_enabled(false);
+        core.tick(true, &mut sink);
+        assert!(sink.0.is_empty()); // can't un-send a PC
+
+        // Turning it back on re-emits because cache was flipped to None.
+        core.set_program_enabled(true);
+        core.tick(true, &mut sink);
+        assert_eq!(sink.0, vec![pc(0, 0, 33)]);
     }
 
     #[test]
