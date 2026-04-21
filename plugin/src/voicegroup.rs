@@ -39,7 +39,7 @@
 //!   because the UI just shows them verbatim.
 
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // -----------------------------------------------------------------------------
@@ -79,44 +79,105 @@ pub struct VoicegroupState {
 /// Precedence:
 ///   1. `CCOMIDI_STATE_PATH` env var — exact file path (useful for tests
 ///      and for advanced users who keep the state file elsewhere)
-///   2. Alongside the loaded plugin binary, matching the C++ behavior:
-///      - macOS: walk up `.../bundle.clap/Contents/MacOS/<binary>` four
-///        levels to the bundle's parent directory
-///      - Linux/Windows: the `.clap` is a single file; use its parent dir
-///
-/// Returns `None` only when even step 2 can't figure out our own path,
-/// which shouldn't happen in practice — the shared lib was loaded by
-/// name, so `dladdr(3)` knows where it is.
+///   2. Candidate list (first existing file wins):
+///      - `<N levels up from the loaded .so/bundle>/poryaaaa_state.json`
+///        for a handful of N's, covering:
+///          · macOS bundle layout (`bundle.clap/Contents/MacOS/binary`)
+///            → 4 levels
+///          · Linux/Windows single-file `.clap` → 1 level
+///          · Bare dev install (`target/bundled/X.clap/…`) resolves to
+///            `target/bundled/` which is probably not where poryaaaa
+///            wrote; higher levels may be the right answer if the user
+///            symlinked the bundle into their CLAP dir
+///      - The canonicalized version of the above (handles the case
+///        where `dladdr` returned the symlink target instead of the
+///        install path)
+///      - `~/Library/Audio/Plug-Ins/CLAP/poryaaaa_state.json` on macOS
+///        / `~/.clap/poryaaaa_state.json` on Linux — the standard
+///        user-scope CLAP plugin directory where poryaaaa itself likely
+///        lives
+///   3. If no candidate exists on disk, returns the first one anyway so
+///      the UI error message can point the user at *where* we looked.
 pub fn resolve_state_path() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("CCOMIDI_STATE_PATH") {
         return Some(PathBuf::from(override_path));
     }
-    derive_state_path_from_library()
+
+    let candidates = candidate_state_paths();
+    if let Some(found) = candidates.iter().find(|p| p.exists()) {
+        return Some(found.clone());
+    }
+    candidates.into_iter().next()
 }
 
-#[cfg(unix)]
-fn derive_state_path_from_library() -> Option<PathBuf> {
-    let lib = current_library_path()?;
+/// Every place we're willing to look for `poryaaaa_state.json`, in
+/// priority order. Exposed to callers only through `resolve_state_path`.
+fn candidate_state_paths() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // Walk up the dladdr-reported dylib path, AND its canonical form.
+    // Canonicalization follows symlinks — useful when the host loaded
+    // us via a symlink but dladdr returned the target path (or vice
+    // versa).
+    #[cfg(unix)]
+    {
+        if let Some(lib) = current_library_path() {
+            out.extend(state_candidates_around(&lib));
+            if let Ok(canonical) = std::fs::canonicalize(&lib) {
+                if canonical != lib {
+                    out.extend(state_candidates_around(&canonical));
+                }
+            }
+        }
+    }
+
+    // User-scope CLAP directory fallback — this is the install location
+    // for poryaaaa, so `poryaaaa_state.json` probably ends up here even
+    // if ccomidi-nih is living somewhere else (dev build, alt install).
     #[cfg(target_os = "macos")]
-    {
-        // lib = …/<bundle>.clap/Contents/MacOS/<binary>
-        // Walk up binary → MacOS → Contents → bundle → parent.
-        let parent_of_bundle = lib.parent()?.parent()?.parent()?.parent()?;
-        Some(parent_of_bundle.join("poryaaaa_state.json"))
+    if let Ok(home) = std::env::var("HOME") {
+        out.push(
+            PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP/poryaaaa_state.json"),
+        );
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // On Linux, the .clap is a single .so — parent is the user's
-        // `~/.clap` (or wherever they installed it).
-        Some(lib.parent()?.join("poryaaaa_state.json"))
+    #[cfg(target_os = "linux")]
+    if let Ok(home) = std::env::var("HOME") {
+        out.push(PathBuf::from(home).join(".clap/poryaaaa_state.json"));
     }
+
+    // Windows fallback — dladdr isn't available, so we rely on env-var
+    // or CWD. Users on Windows should set `CCOMIDI_STATE_PATH`.
+    #[cfg(not(unix))]
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push(cwd.join("poryaaaa_state.json"));
+    }
+
+    // Deduplicate while preserving order.
+    out.dedup();
+    out
 }
 
-#[cfg(not(unix))]
-fn derive_state_path_from_library() -> Option<PathBuf> {
-    // Windows fallback: no dladdr. Use CWD as a last-ditch attempt; users
-    // on Windows should set CCOMIDI_STATE_PATH explicitly.
-    Some(std::env::current_dir().ok()?.join("poryaaaa_state.json"))
+/// Build the candidate list "walk up from `lib` looking for siblings".
+///
+/// We walk up to 5 levels. That covers:
+///   - Linux/Windows flat `.clap`: level 1
+///   - macOS bundle: level 4 (bundle/Contents/MacOS/binary)
+///   - anything deeper (dev builds nested inside target/bundled/): the
+///     higher levels are still plausible locations if the user symlinked
+///     the bundle into the OS CLAP dir
+fn state_candidates_around(lib: &Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    let mut dir = lib.parent();
+    for _ in 0..5 {
+        match dir {
+            Some(d) => {
+                v.push(d.join("poryaaaa_state.json"));
+                dir = d.parent();
+            }
+            None => break,
+        }
+    }
+    v
 }
 
 #[cfg(unix)]
@@ -177,14 +238,17 @@ pub fn load_state(path: &std::path::Path) -> VoicegroupState {
     };
 
     // Stat first. If the file doesn't exist yet, the user probably hasn't
-    // loaded poryaaaa in the DAW — give them that specific hint.
+    // loaded poryaaaa in the DAW — give them that specific hint, and
+    // include the path we looked at so the user can verify or set
+    // `CCOMIDI_STATE_PATH` to point elsewhere.
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(_) => {
-            out.error = Some(
-                "poryaaaa hasn't written its state yet — load poryaaaa in the DAW."
-                    .to_string(),
-            );
+            out.error = Some(format!(
+                "poryaaaa_state.json not found at {}. Load poryaaaa in the DAW, \
+                 or set $CCOMIDI_STATE_PATH to override.",
+                path.display()
+            ));
             return out;
         }
     };
