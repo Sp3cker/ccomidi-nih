@@ -1,0 +1,5 @@
+# nih_plug_xtask bundling manifest — one entry per cdylib in the workspace.
+# Keys must match the Cargo package name.
+
+[ccomidi-nih]
+name = "ccomidi-nih"
