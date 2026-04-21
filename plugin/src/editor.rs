@@ -40,6 +40,25 @@ const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
     "Volume", "Pan", "Mod", "LFO Speed", "xCIEV", "xCIEL",
 ];
 
+/// Shared interaction stylesheet.
+///
+/// Adding `.class("tap")` to any interactive widget opts it into a
+/// brief scale-down on press — the tactile feedback principle from the
+/// make-interfaces-feel-better skill. Vizia's CSS supports the `scale`
+/// property directly (not via `transform`); transitions are declared
+/// with `transition: <property> <duration>`.
+///
+/// 0.96 is the specific value the skill calls for (never below 0.95).
+const INTERACTION_CSS: &str = "
+.tap {
+    scale: 1;
+    transition: scale 100ms;
+}
+.tap:active {
+    scale: 0.96;
+}
+";
+
 /// Which page of the editor is currently visible.
 ///
 /// Vizia's `Data` trait is required for any type used as a lens target.
@@ -149,6 +168,9 @@ pub(crate) fn create(
         cx.add_font_mem(include_bytes!("../Calamity-Regular.otf"));
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
+        // Best-effort stylesheet load; if Vizia rejects the CSS the UI
+        // still works, it just won't animate.
+        let _ = cx.add_stylesheet(INTERACTION_CSS);
 
         // Synchronous initial load so the status line + instrument list
         // are populated before the user ever touches Reload.
@@ -226,6 +248,7 @@ fn tab_button(cx: &mut Context, label: &str, tab: Tab, width: f32) {
     .height(Pixels(30.0))
     .border_radius(Pixels(6.0))
     .cursor(CursorIcon::Hand)
+    .class("tap")
     .background_color(Data::active_tab.map(move |t| {
         if *t == tab {
             Color::rgb(110, 140, 220)
@@ -348,6 +371,8 @@ fn channel_radio_button(cx: &mut Context, ch: u8) {
     // Pointing-hand cursor on hover signals the button is clickable,
     // consistent with web / macOS native button expectations.
     .cursor(CursorIcon::Hand)
+    // Tactile scale-down on press — see the `tap` rule in INTERACTION_CSS.
+    .class("tap")
     // Selected button gets a distinct fill. `.map(…)` on a lens produces a
     // new lens whose target is the mapped value — so this cell's background
     // automatically re-renders when the channel param changes from any
@@ -408,7 +433,9 @@ fn voicegroup_row(cx: &mut Context) {
             |cx| cx.emit(AppEvent::ReloadVoicegroup),
             |cx| Label::new(cx, "Reload"),
         )
-        .width(Pixels(80.0));
+        .width(Pixels(80.0))
+        .cursor(CursorIcon::Hand)
+        .class("tap");
     })
     .col_between(Pixels(8.0))
     .height(Pixels(26.0))
@@ -522,6 +549,7 @@ where
     .height(Pixels(22.0))
     .border_radius(Pixels(5.0))
     .cursor(CursorIcon::Hand)
+    .class("tap")
     .background_color(Data::params.map(move |p| {
         if getter(p).value() {
             Color::rgb(110, 140, 220)
