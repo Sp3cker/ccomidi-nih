@@ -76,9 +76,10 @@ impl Model for Data {
 }
 
 pub(crate) fn default_state() -> Arc<ViziaState> {
-    // 1.25 user scale carries over; height bumped to 400 so sections
-    // breathe — the rhythm-focused pass increased vertical padding.
-    ViziaState::new_with_default_scale_factor(|| (600, 400), 1.25)
+    // 1.25 user scale carries over; height grown to fit the centered
+    // "Output channel" caption above the button row plus the voicegroup
+    // section at the bottom that was clipping at 400.
+    ViziaState::new_with_default_scale_factor(|| (600, 500), 1.25)
 }
 
 pub(crate) fn create(
@@ -147,24 +148,31 @@ fn transport_row(cx: &mut Context) {
 /// Clicking a button normalizes the channel index and emits the three-event
 /// param-change sequence nih-plug expects from custom widgets.
 fn channel_radio_row(cx: &mut Context) {
-    HStack::new(cx, |cx| {
-        Label::new(cx, "Channel")
+    VStack::new(cx, |cx| {
+        // Caption above, centered horizontally. `child_space(Stretch)` puts
+        // stretch on both sides of the label text, which centers it inside
+        // the label's own (full-width) box.
+        Label::new(cx, "Output channel")
             .font_size(11.0)
-            .width(Pixels(60.0))
-            // Optical centering: the label's font cap-height visually
-            // aligns with the buttons by stretching space above and below.
-            .child_top(Stretch(1.0))
-            .child_bottom(Stretch(1.0));
+            .height(Pixels(16.0))
+            .child_space(Stretch(1.0));
 
-        for ch in 0u8..16 {
-            channel_radio_button(cx, ch);
-        }
+        // Button row, also centered. `child_left/right(Stretch)` on the
+        // HStack pushes stretch-space to the sides while the 16 buttons
+        // keep their intrinsic widths — no row-fill stretching between
+        // them.
+        HStack::new(cx, |cx| {
+            for ch in 0u8..16 {
+                channel_radio_button(cx, ch);
+            }
+        })
+        .col_between(Pixels(3.0))
+        .height(Pixels(32.0))
+        .child_left(Stretch(1.0))
+        .child_right(Stretch(1.0));
     })
-    // 4px between buttons — cleaner rhythm than the previous 2px and
-    // reinforces each button as its own hit target rather than one mass.
-    .col_between(Pixels(4.0))
-    .height(Pixels(32.0))
-    .child_left(Pixels(16.0));
+    .row_between(Pixels(4.0))
+    .height(Pixels(52.0));
 }
 
 /// One of the 16 channel buttons.
