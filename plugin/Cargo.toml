@@ -6,7 +6,10 @@ license = "MIT"
 description = "NIH-plug + Vizia prototype for ccomidi"
 
 [lib]
-crate-type = ["cdylib"]
+# "cdylib" builds the CLAP-loadable shared library.
+# "rlib" is also needed so `cargo test` can link the crate as a normal Rust
+# library for unit tests.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["assert_process_allocs"] }

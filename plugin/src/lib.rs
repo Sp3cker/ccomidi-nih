@@ -2,6 +2,15 @@ use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use std::sync::Arc;
 
+// Framework-agnostic MIDI command logic (ported from the C++ ccomidi project).
+// Not yet wired into `process` — that happens in a later pass once we design
+// the nih-plug parameter layout. Kept in the tree so `cargo test` exercises
+// it and the build keeps it honest.
+//
+// `dead_code` + `unused_imports` are expected until phase 2 hooks this up.
+#[allow(dead_code, unused_imports)]
+mod core;
+
 mod editor;
 
 pub struct CComidiPlugin {
