@@ -44,15 +44,18 @@ const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
 
 /// Messages the editor fires at itself.
 ///
-/// - `ReloadVoicegroup` rereads `poryaaaa_state.json` and refreshes
-///   `Data::vg_status`.
-/// - `EmitAddInstrument` reads the current `add_instrument_index` param
-///   and stores it into the shared `pending_add_instrument` atomic; the
-///   audio thread picks it up on its next block and emits CC#98/#99.
+/// - `ReloadVoicegroup` rereads `poryaaaa_state.json`, refreshes
+///   `Data::vg_status`, and updates the instrument list behind the
+///   dropdown.
+/// - `SelectInstrument(idx)` is fired by the PickList when the user
+///   picks an entry. We immediately store the index into the shared
+///   `pending_add_instrument` atomic so the audio thread emits CC#98/#99
+///   on its next block — matching the C++ "pick = send" UX. The
+///   selection itself is transient (not persisted).
 #[derive(Debug)]
 enum AppEvent {
     ReloadVoicegroup,
-    EmitAddInstrument,
+    SelectInstrument(usize),
 }
 
 /// Root Vizia model.
@@ -64,20 +67,40 @@ struct Data {
     /// `VoicegroupState`) because Vizia's `Data` trait is already
     /// implemented for `String` — no manual impl needed.
     vg_status: String,
+    /// Ordered list of instrument display names — the backing data for
+    /// the "Add Instrument" PickList. Updated on Reload.
+    instruments: Vec<String>,
+    /// Index of the currently highlighted entry in `instruments`.
+    /// Purely UI state (matches C++'s un-persisted `availableSelection`).
+    selected_instrument: usize,
 }
 
 impl Model for Data {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|app_event: &AppEvent, _| match app_event {
             AppEvent::ReloadVoicegroup => {
-                self.vg_status = format_status(&load_voicegroup());
+                let state = load_voicegroup();
+                self.vg_status = format_status(&state);
+                self.instruments = state.available_instruments;
+                // Keep the selection in range after a list refresh; 0 is
+                // a safe fallback even if the list is empty (the PickList
+                // won't dereference it until the user opens the popup).
+                if self.selected_instrument >= self.instruments.len() {
+                    self.selected_instrument = 0;
+                }
             }
-            AppEvent::EmitAddInstrument => {
-                let idx = self.params.add_instrument_index.value();
-                // `Release` pairs with the audio thread's `AcqRel` swap;
-                // nothing on the UI side needs synchronizing *before* this
-                // store, so a plain release is enough.
-                self.pending_add_instrument.store(idx, Ordering::Release);
+            AppEvent::SelectInstrument(idx) => {
+                self.selected_instrument = *idx;
+                // The 14-bit CC pair can only address 0..=16383. Larger
+                // indices are silently dropped — the audio thread also
+                // re-validates, so this is belt-and-suspenders.
+                if (*idx as u32) <= crate::voicegroup::MAX_INSTRUMENT_INDEX {
+                    // `Release` pairs with the audio thread's `AcqRel`
+                    // swap; nothing on the UI side needs synchronizing
+                    // *before* this store, so a plain release is enough.
+                    self.pending_add_instrument
+                        .store(*idx as i32, Ordering::Release);
+                }
             }
         });
     }
@@ -100,14 +123,17 @@ pub(crate) fn create(
         assets::register_noto_sans_light(cx);
         assets::register_noto_sans_thin(cx);
 
-        // Synchronous initial load so the status line shows something
-        // useful before the user touches Reload.
-        let initial_status = format_status(&load_voicegroup());
+        // Synchronous initial load so the status line + instrument list
+        // are populated before the user ever touches Reload.
+        let initial_state = load_voicegroup();
+        let initial_status = format_status(&initial_state);
 
         Data {
             params: params.clone(),
             pending_add_instrument: pending_add_instrument.clone(),
             vg_status: initial_status,
+            instruments: initial_state.available_instruments,
+            selected_instrument: 0,
         }
         .build(cx);
 
@@ -298,27 +324,30 @@ fn voicegroup_row(cx: &mut Context) {
     .child_left(Pixels(12.0));
 }
 
-/// Voicegroup line 2: index slider + Add Instrument button.
+/// Voicegroup line 2: instrument PickList — picking an entry immediately
+/// fires the Add-Instrument CC pair (matching C++ "select = send" UX,
+/// no separate Add button needed).
 fn add_instrument_row(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        Label::new(cx, "Add Instrument #")
+        Label::new(cx, "Add instrument")
             .font_size(11.0)
-            .width(Pixels(130.0))
+            .width(Pixels(110.0))
             .child_top(Stretch(1.0))
             .child_bottom(Stretch(1.0));
 
-        ParamSlider::new(cx, Data::params, |p| &p.add_instrument_index).width(Pixels(260.0));
-
-        Button::new(
-            cx,
-            |cx| cx.emit(AppEvent::EmitAddInstrument),
-            |cx| Label::new(cx, "Add"),
-        )
-        .width(Pixels(70.0));
+        // `PickList::new(cx, items_lens, selected_lens, show_chevron)`
+        // renders the currently-selected string as the collapsed view,
+        // and a scrollable list of all entries as the popup.
+        PickList::new(cx, Data::instruments, Data::selected_instrument, true)
+            .width(Pixels(360.0))
+            .cursor(CursorIcon::Hand)
+            .on_select(|cx, idx| {
+                cx.emit(AppEvent::SelectInstrument(idx));
+            });
     })
     .col_between(Pixels(8.0))
-    .height(Pixels(26.0))
-    .child_left(Pixels(12.0));
+    .height(Pixels(32.0))
+    .child_left(Pixels(16.0));
 }
 
 /// Small layout helper: caption above a control.

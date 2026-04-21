@@ -192,12 +192,6 @@ pub struct CComidiParams {
     #[id = "p"]
     pub program: IntParam,
 
-    /// 14-bit index for the Add-Instrument CC#98/#99 pair. Restored after
-    /// an in-progress refactor temporarily removed it; still referenced
-    /// by `editor.rs::add_instrument_row`.
-    #[id = "ai"]
-    pub add_instrument_index: IntParam,
-
     /// 4 fixed rows. Cross-array id collisions are prevented at the inner
     /// `#[id]` level: FixedRowParams uses `fxen`/`fxv`, DynamicRowParams
     /// uses `dyen`/`dyc`/…, so the resulting fully-qualified ids (e.g.
@@ -222,15 +216,6 @@ impl Default for CComidiParams {
             // start. The user can still toggle it off.
             program_enabled: BoolParam::new("Program On", true),
             program: IntParam::new("Program", 0, IntRange::Linear { min: 0, max: 127 }),
-
-            add_instrument_index: IntParam::new(
-                "Add Instrument Index",
-                0,
-                IntRange::Linear {
-                    min: 0,
-                    max: crate::voicegroup::MAX_INSTRUMENT_INDEX as i32,
-                },
-            ),
 
             // Volume and Pan default enabled at 64 (center/half) so a
             // freshly-inserted plugin makes audible sound without having
