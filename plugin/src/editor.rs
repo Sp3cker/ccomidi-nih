@@ -28,10 +28,10 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::params::{CComidiParams, DYN_ROWS, FIXED_ROWS};
-use crate::voicegroup::{self, VoicegroupState};
+use crate::voicegroup::{self, VoiceSlot, VoicegroupState};
 
 /// User-facing labels for the six fixed rows. Indexed 0..FIXED_ROWS.
 /// The enabled toggle is now a plain colored square (see `bool_toggle`);
@@ -79,6 +79,17 @@ impl nih_plug_vizia::vizia::prelude::Data for Tab {
     }
 }
 
+// `VoiceSlot` needs `Data` so `Vec<VoiceSlot>` can be a lens target on
+// `Data::slots`. Can't derive it in `voicegroup.rs` without dragging the
+// vizia prelude into that otherwise framework-agnostic module, so the
+// impl lives here (the orphan rule lets us do this because `VoiceSlot`
+// is our own type).
+impl nih_plug_vizia::vizia::prelude::Data for VoiceSlot {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// Messages the editor fires at itself.
 ///
 /// - `ReloadVoicegroup` rereads `poryaaaa_state.json`, refreshes
@@ -95,6 +106,10 @@ enum AppEvent {
     ReloadVoicegroup,
     SelectInstrument(usize),
     SwitchTab(Tab),
+    /// User edited the track-label textbox. Writes through to the
+    /// persistent `Arc<RwLock<String>>` on the params struct so the value
+    /// survives project reloads.
+    SetTrackLabel(String),
 }
 
 /// Root Vizia model.
@@ -106,6 +121,11 @@ struct Data {
     /// `VoicegroupState`) because Vizia's `Data` trait is already
     /// implemented for `String` — no manual impl needed.
     vg_status: String,
+    /// Current voicegroup slots (program → instrument mapping). The Pan
+    /// row uses this to decide whether the loaded instrument is a
+    /// hardware channel (L/C/R enum pan) or DirectSound (continuous
+    /// pan). Refreshed whenever [`AppEvent::ReloadVoicegroup`] fires.
+    slots: Vec<VoiceSlot>,
     /// Ordered list of instrument display names — the backing data for
     /// the "Add Instrument" PickList. Updated on Reload.
     instruments: Vec<String>,
@@ -116,6 +136,13 @@ struct Data {
     /// every time the editor is opened. Row param values persist via
     /// nih-plug regardless of tab visibility, so this doesn't hide data.
     active_tab: Tab,
+    /// Mirror of `track_label_storage`'s current string. Lives here
+    /// (rather than lensing directly through the Arc/RwLock) because
+    /// Vizia's reactive binding wants a plain `String` lens target.
+    track_label: String,
+    /// Persistent backing store, shared with `CComidiParams::track_label`
+    /// so edits land in the `#[persist]`-serialized form.
+    track_label_storage: Arc<RwLock<String>>,
 }
 
 impl Model for Data {
@@ -124,6 +151,7 @@ impl Model for Data {
             AppEvent::ReloadVoicegroup => {
                 let state = load_voicegroup();
                 self.vg_status = format_status(&state);
+                self.slots = state.slots;
                 self.instruments = state.available_instruments;
                 // Keep the selection in range after a list refresh; 0 is
                 // a safe fallback even if the list is empty (the PickList
@@ -147,6 +175,16 @@ impl Model for Data {
             }
             AppEvent::SwitchTab(tab) => {
                 self.active_tab = *tab;
+            }
+            AppEvent::SetTrackLabel(s) => {
+                // Write-through: update the mirrored string that the
+                // lens reads from, then push the same value into the
+                // persistent storage so nih-plug serializes it next
+                // time the host saves project/preset state. `write()`
+                // can only fail if another thread panicked while
+                // holding the lock — treat that as fatal.
+                self.track_label = s.clone();
+                *self.track_label_storage.write().unwrap() = s.clone();
             }
         });
     }
@@ -177,21 +215,32 @@ pub(crate) fn create(
         let initial_state = load_voicegroup();
         let initial_status = format_status(&initial_state);
 
+        // Seed the mirrored label from whatever nih-plug restored from
+        // project state before `editor()` was called. If the lock is
+        // poisoned we fall back to an empty string rather than panic —
+        // losing a label is less bad than failing to open the editor.
+        let initial_label = params
+            .track_label
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let track_label_storage = params.track_label.clone();
+
         Data {
             params: params.clone(),
             pending_add_instrument: pending_add_instrument.clone(),
             vg_status: initial_status,
+            slots: initial_state.slots,
             instruments: initial_state.available_instruments,
             selected_instrument: 0,
             active_tab: Tab::Main,
+            track_label: initial_label,
+            track_label_storage,
         }
         .build(cx);
 
         VStack::new(cx, |cx| {
-            Label::new(cx, "ccomidi")
-                .font_size(24.0)
-                .height(Pixels(36.0))
-                .child_space(Stretch(1.0));
+            title_row(cx);
 
             tab_bar(cx);
 
@@ -214,6 +263,43 @@ pub(crate) fn create(
         .child_top(Pixels(12.0))
         .child_bottom(Pixels(12.0));
     })
+}
+
+// -----------------------------------------------------------------------------
+// Title row: plugin name + user-entered track label
+// -----------------------------------------------------------------------------
+
+/// Header strip: the "ccomidi" wordmark on the left, a free-form
+/// "Track label" textbox on the right.
+///
+/// Why a manual textbox and not a CLAP-provided track name: see
+/// CLAUDE.md — the host-provided `clap.track-info/1` isn't wrapped by
+/// nih-plug and only Bitwig/Reaper implement it anyway. A persisted
+/// user string works in every DAW and survives project reloads.
+fn title_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, "ccomidi")
+            .font_size(24.0)
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        // `on_submit` fires on Enter or when the textbox loses focus,
+        // which is what you'd expect from a "name a thing" field. The
+        // `bool` arg of the callback is whether Enter was pressed — we
+        // don't care, either path should commit.
+        Textbox::new(cx, Data::track_label)
+            .on_submit(|cx, value, _| {
+                cx.emit(AppEvent::SetTrackLabel(value));
+            })
+            .width(Pixels(240.0))
+            .height(Pixels(26.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+    })
+    .col_between(Pixels(12.0))
+    .height(Pixels(40.0))
+    .child_left(Pixels(16.0))
+    .child_right(Pixels(16.0));
 }
 
 // -----------------------------------------------------------------------------
@@ -268,7 +354,15 @@ fn main_tab_content(cx: &mut Context) {
 
     section_header(cx, "Fixed commands");
     for i in 0..FIXED_ROWS {
-        fixed_row(cx, i);
+        // Pan is special-cased: for Square/Noise/ProgWave hardware
+        // channels it's a 3-way enumeration (L/C/R → 0/64/127), for
+        // DirectSound (and anything else we don't recognize) it's the
+        // normal continuous slider. See `pan_row` for the dispatch.
+        if i == 1 {
+            pan_row(cx);
+        } else {
+            fixed_row(cx, i);
+        }
     }
 
     section_header(cx, "Voicegroup");
@@ -489,6 +583,112 @@ fn section_header(cx: &mut Context, title: &str) {
         .height(Pixels(28.0))
         .child_top(Pixels(10.0))
         .child_left(Pixels(16.0));
+}
+
+/// Pan row — variant of `fixed_row` that swaps the slider for a 3-way
+/// L/C/R segmented control when the program number points at a GBA
+/// hardware channel (Square, Noise, ProgWave). For DirectSound and
+/// anything unrecognized we keep the normal continuous slider.
+///
+/// The underlying parameter stays an `IntParam(0..=127)` — we just pick
+/// a different widget. Buttons write 0, 64, or 127 to it.
+///
+/// # Reactivity
+///
+/// Two nested `Binding`s trigger a rebuild of the right-hand widget:
+/// - outer watches `Data::slots` (voicegroup reload)
+/// - inner watches the `program` param value
+///
+/// Either change can flip the loaded instrument kind, so both need to
+/// invalidate the subtree. Rebuild cost is negligible — a handful of
+/// widgets.
+fn pan_row(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        bool_toggle(cx, |p| &p.fixed_rows[1].enabled);
+
+        Label::new(cx, FIXED_ROW_LABELS[1])
+            .font_size(11.0)
+            .width(Pixels(90.0))
+            .child_top(Stretch(1.0))
+            .child_bottom(Stretch(1.0));
+
+        Binding::new(cx, Data::slots, |cx, _| {
+            Binding::new(cx, Data::params.map(|p| p.program.value()), |cx, _| {
+                let slots = Data::slots.get(cx);
+                let program = Data::params.get(cx).program.value() as u8;
+                let kind = voicegroup::kind_for_program(&slots, program);
+                if kind.is_enum_pan() {
+                    three_way_pan(cx);
+                } else {
+                    ParamSlider::new(cx, Data::params, |p| &p.fixed_rows[1].value)
+                        .width(Pixels(400.0));
+                }
+            });
+        });
+    })
+    .col_between(Pixels(8.0))
+    .height(Pixels(28.0))
+    .child_left(Pixels(16.0));
+}
+
+/// The 3-button L / C / R segmented control shown in place of the Pan
+/// slider for hardware-channel instruments. Each button writes the
+/// corresponding MIDI CC value (0 / 64 / 127) to the same underlying
+/// `fixed_rows[1].value` param the slider uses, so automation and the
+/// emitted CC stream are identical in both modes.
+fn three_way_pan(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        pan_choice_button(cx, "L", 0);
+        pan_choice_button(cx, "C", 64);
+        pan_choice_button(cx, "R", 127);
+    })
+    .col_between(Pixels(4.0))
+    .width(Pixels(400.0))
+    .height(Pixels(26.0));
+}
+
+/// One of the three Pan choices. Looks and behaves like a
+/// `channel_radio_button` — selected state is lens-bound to the param
+/// value, so host automation, preset recall, and slider-mode writes
+/// all repaint it correctly.
+fn pan_choice_button(cx: &mut Context, label: &str, value: i32) {
+    let owned_label = label.to_string();
+
+    Button::new(
+        cx,
+        move |cx| {
+            // Same three-event handshake as `channel_radio_button`:
+            // Begin / SetNormalized / End is the contract nih-plug's
+            // host wrapper expects from custom param widgets.
+            let params = Data::params.get(cx);
+            let ptr = params.fixed_rows[1].value.as_ptr();
+            let normalized = params.fixed_rows[1].value.preview_normalized(value);
+            cx.emit(RawParamEvent::BeginSetParameter(ptr));
+            cx.emit(RawParamEvent::SetParameterNormalized(ptr, normalized));
+            cx.emit(RawParamEvent::EndSetParameter(ptr));
+        },
+        move |cx| {
+            Label::new(cx, owned_label.as_str())
+                .font_size(12.0)
+                .color(Color::white())
+                .child_space(Stretch(1.0))
+        },
+    )
+    // Three buttons share a 400px row; 130 + 4 + 130 + 4 + 130 = 398 —
+    // leaves a hair for the col_between gaps to absorb without layout
+    // overflow.
+    .width(Pixels(130.0))
+    .height(Pixels(26.0))
+    .border_radius(Pixels(5.0))
+    .cursor(CursorIcon::Hand)
+    .class("tap")
+    .background_color(Data::params.map(move |p| {
+        if p.fixed_rows[1].value.value() == value {
+            Color::rgb(110, 140, 220)
+        } else {
+            Color::rgb(60, 60, 70)
+        }
+    }));
 }
 
 /// A fixed-row: toggle (colored square) + text label + value slider.

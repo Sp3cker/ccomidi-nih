@@ -330,6 +330,91 @@ pub const MAX_INSTRUMENT_INDEX: u32 = 0x3FFF; // 16383
 pub const NO_PENDING_INSTRUMENT: i32 = -1;
 
 // -----------------------------------------------------------------------------
+// Instrument-kind classification (name heuristic)
+// -----------------------------------------------------------------------------
+
+/// What kind of synthesis backs a voicegroup slot, inferred from the slot's
+/// display name. Used by the editor to pick the right Pan UI: the GBA
+/// hardware channels (Square 1/2, Noise, Programmable Wave) only expose
+/// Pan as hard-L / Center / hard-R, while DirectSound samples (and any
+/// container that resolves to DS — keysplits, drumsets) support the full
+/// continuous 0..=127 range.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum InstrumentKind {
+    /// Square-wave hardware channel. Pan snaps to L/C/R.
+    Square,
+    /// Noise hardware channel. Pan snaps to L/C/R.
+    Noise,
+    /// Programmable-wave hardware channel. Pan snaps to L/C/R.
+    ProgWave,
+    /// DirectSound sample, keysplit, drumset, or anything else we don't
+    /// recognize. Pan is continuous 0..=127.
+    Other,
+}
+
+impl InstrumentKind {
+    /// True if Pan on this instrument should be presented as a 3-way
+    /// enumeration (Left / Center / Right) rather than a 0..=127 slider.
+    pub fn is_enum_pan(&self) -> bool {
+        matches!(self, Self::Square | Self::Noise | Self::ProgWave)
+    }
+}
+
+/// Heuristically classify a slot name into an [`InstrumentKind`].
+///
+/// Safe-by-default: anything that doesn't clearly look like a hardware
+/// channel falls through to [`InstrumentKind::Other`], which keeps the
+/// continuous Pan slider. That's the right bias — showing a slider on a
+/// hardware channel is a minor UX miss, but snapping a DirectSound
+/// sample's Pan to only three values would quietly destroy the user's
+/// intent.
+///
+/// The patterns match the `poryaaaa_state.json` slot-name convention
+/// observed in practice (e.g. "Square 1", "Noise", "ProgWave 1"). Names
+/// are trimmed and lowercased before matching so "SQUARE 1", " square 1",
+/// and "Square 1" all classify the same way.
+pub fn classify_name(name: &str) -> InstrumentKind {
+    let n = name.trim().to_lowercase();
+
+    // "square", "square 1", "square_2", "squarewave", "square alt", …
+    if n.starts_with("square") || n.starts_with("sq ") {
+        return InstrumentKind::Square;
+    }
+
+    // Bare "noise" / "noise 1" / "noise alt". We intentionally match the
+    // *start* of the name, so available-instrument names like
+    // "register_noise" (a DirectSound sample with "noise" in the middle)
+    // stay classified as Other.
+    if n.starts_with("noise") {
+        return InstrumentKind::Noise;
+    }
+
+    // "progwave", "prog wave", "prog_wave", "programmable wave", "pwave".
+    if n.starts_with("progwave")
+        || n.starts_with("prog wave")
+        || n.starts_with("prog_wave")
+        || n.starts_with("programmable wave")
+        || n.starts_with("pwave")
+    {
+        return InstrumentKind::ProgWave;
+    }
+
+    InstrumentKind::Other
+}
+
+/// Look up the currently-loaded instrument for a program number and
+/// classify it. Returns `Other` if the program isn't present in the
+/// voicegroup (unconfigured slot → show the slider rather than
+/// guessing).
+pub fn kind_for_program(slots: &[VoiceSlot], program: u8) -> InstrumentKind {
+    slots
+        .iter()
+        .find(|s| s.program == program)
+        .map(|s| classify_name(&s.name))
+        .unwrap_or(InstrumentKind::Other)
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -441,5 +526,63 @@ mod tests {
         let resolved = resolve_state_path().unwrap();
         assert_eq!(resolved, tmp);
         std::env::remove_var("CCOMIDI_STATE_PATH");
+    }
+
+    #[test]
+    fn classifies_hardware_channel_names() {
+        assert_eq!(classify_name("Square 1"), InstrumentKind::Square);
+        assert_eq!(classify_name("square 2"), InstrumentKind::Square);
+        assert_eq!(classify_name("Square_alt"), InstrumentKind::Square);
+        assert_eq!(classify_name("SquareWave"), InstrumentKind::Square);
+        assert_eq!(classify_name("Noise"), InstrumentKind::Noise);
+        assert_eq!(classify_name("noise alt"), InstrumentKind::Noise);
+        assert_eq!(classify_name("ProgWave 1"), InstrumentKind::ProgWave);
+        assert_eq!(classify_name("prog_wave"), InstrumentKind::ProgWave);
+        assert_eq!(classify_name("Programmable Wave"), InstrumentKind::ProgWave);
+    }
+
+    #[test]
+    fn classifies_directsound_and_containers_as_other() {
+        // These names were pulled from a real poryaaaa_state.json —
+        // anything DirectSound-backed, or a container (keysplit /
+        // drumset / nested voicegroup), must stay on the continuous
+        // pan slider.
+        assert_eq!(classify_name("16.pcm"), InstrumentKind::Other);
+        assert_eq!(
+            classify_name("sc88pro_pizzicato_strings.bin"),
+            InstrumentKind::Other
+        );
+        assert_eq!(
+            classify_name("voicegroup_piano_keysplit"),
+            InstrumentKind::Other
+        );
+        assert_eq!(classify_name("voicegroup192"), InstrumentKind::Other);
+        // "register_noise" has "noise" as a *suffix*; it's a DS sample,
+        // not the Noise hardware channel. Our `starts_with` heuristic
+        // keeps it classified as Other.
+        assert_eq!(classify_name("register_noise"), InstrumentKind::Other);
+    }
+
+    #[test]
+    fn kind_for_program_uses_matching_slot() {
+        let slots = vec![
+            VoiceSlot {
+                program: 0,
+                name: "Square 1".into(),
+            },
+            VoiceSlot {
+                program: 2,
+                name: "16.pcm".into(),
+            },
+            VoiceSlot {
+                program: 7,
+                name: "Noise".into(),
+            },
+        ];
+        assert_eq!(kind_for_program(&slots, 0), InstrumentKind::Square);
+        assert_eq!(kind_for_program(&slots, 2), InstrumentKind::Other);
+        assert_eq!(kind_for_program(&slots, 7), InstrumentKind::Noise);
+        // Unknown program → Other (safe default: show the slider).
+        assert_eq!(kind_for_program(&slots, 5), InstrumentKind::Other);
     }
 }

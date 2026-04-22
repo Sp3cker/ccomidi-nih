@@ -25,7 +25,7 @@
 
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::core::CommandType;
 
@@ -183,6 +183,14 @@ pub struct CComidiParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
 
+    /// User-entered label shown next to the plugin title. No standard CLAP
+    /// extension gives us the host track name across every DAW (only
+    /// Bitwig/Reaper implement `clap.track-info/1`, and nih-plug doesn't
+    /// surface it), so this is the portable fallback: the user types it
+    /// once and it persists with the project via nih-plug's `#[persist]`.
+    #[persist = "track-label"]
+    pub track_label: Arc<RwLock<String>>,
+
     #[id = "ch"]
     pub channel: IntParam,
 
@@ -208,6 +216,7 @@ impl Default for CComidiParams {
     fn default() -> Self {
         Self {
             editor_state: crate::editor::default_state(),
+            track_label: Arc::new(RwLock::new(String::new())),
 
             channel: IntParam::new("Channel", 0, IntRange::Linear { min: 0, max: 15 }),
 
