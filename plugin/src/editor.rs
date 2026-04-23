@@ -27,14 +27,12 @@ use nih_plug::prelude::{Editor, Param};
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::params::{CComidiParams, DYN_ROWS, FIXED_ROWS};
 use crate::voicegroup::{self, VoiceSlot, VoicegroupState};
 
-/// User-facing labels for the six fixed rows. Indexed 0..FIXED_ROWS.
-/// The enabled toggle is now a plain colored square (see `bool_toggle`);
+/// User-facing labels for the six fixed rows.
 /// these labels sit beside it so the user can read what the row does.
 const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
     "Volume", "Pan", "Mod", "LFO Speed", "xCIEV", "xCIEL",
@@ -43,12 +41,10 @@ const FIXED_ROW_LABELS: [&str; FIXED_ROWS] = [
 /// Shared interaction stylesheet.
 ///
 /// Adding `.class("tap")` to any interactive widget opts it into a
-/// brief scale-down on press — the tactile feedback principle from the
-/// make-interfaces-feel-better skill. Vizia's CSS supports the `scale`
+/// brief scale-down on press CSS supports the `scale`
 /// property directly (not via `transform`); transitions are declared
 /// with `transition: <property> <duration>`.
-///
-/// 0.96 is the specific value the skill calls for (never below 0.95).
+
 const INTERACTION_CSS: &str = "
 .tap {
     scale: 1;
@@ -92,19 +88,12 @@ impl nih_plug_vizia::vizia::prelude::Data for VoiceSlot {
 
 /// Messages the editor fires at itself.
 ///
-/// - `ReloadVoicegroup` rereads `poryaaaa_state.json`, refreshes
-///   `Data::vg_status`, and updates the instrument list behind the
-///   dropdown.
-/// - `SelectInstrument(idx)` is fired by the PickList when the user
-///   picks an entry. We immediately store the index into the shared
-///   `pending_add_instrument` atomic so the audio thread emits CC#98/#99
-///   on its next block — matching the C++ "pick = send" UX. The
-///   selection itself is transient (not persisted).
+/// - `ReloadVoicegroup` rereads `poryaaaa_state.json` and refreshes
+///   `Data::vg_status` + `Data::slots`.
 /// - `SwitchTab(tab)` flips the top-level page.
 #[derive(Debug)]
 enum AppEvent {
     ReloadVoicegroup,
-    SelectInstrument(usize),
     SwitchTab(Tab),
     /// User edited the track-label textbox. Writes through to the
     /// persistent `Arc<RwLock<String>>` on the params struct so the value
@@ -116,7 +105,6 @@ enum AppEvent {
 #[derive(Lens)]
 struct Data {
     params: Arc<CComidiParams>,
-    pending_add_instrument: Arc<AtomicI32>,
     /// One-line summary for the UI. `String` (rather than the full
     /// `VoicegroupState`) because Vizia's `Data` trait is already
     /// implemented for `String` — no manual impl needed.
@@ -126,12 +114,6 @@ struct Data {
     /// hardware channel (L/C/R enum pan) or DirectSound (continuous
     /// pan). Refreshed whenever [`AppEvent::ReloadVoicegroup`] fires.
     slots: Vec<VoiceSlot>,
-    /// Ordered list of instrument display names — the backing data for
-    /// the "Add Instrument" PickList. Updated on Reload.
-    instruments: Vec<String>,
-    /// Index of the currently highlighted entry in `instruments`.
-    /// Purely UI state (matches C++'s un-persisted `availableSelection`).
-    selected_instrument: usize,
     /// Which top-level page is on screen. Ephemeral — resets to `Main`
     /// every time the editor is opened. Row param values persist via
     /// nih-plug regardless of tab visibility, so this doesn't hide data.
@@ -152,26 +134,6 @@ impl Model for Data {
                 let state = load_voicegroup();
                 self.vg_status = format_status(&state);
                 self.slots = state.slots;
-                self.instruments = state.available_instruments;
-                // Keep the selection in range after a list refresh; 0 is
-                // a safe fallback even if the list is empty (the PickList
-                // won't dereference it until the user opens the popup).
-                if self.selected_instrument >= self.instruments.len() {
-                    self.selected_instrument = 0;
-                }
-            }
-            AppEvent::SelectInstrument(idx) => {
-                self.selected_instrument = *idx;
-                // The 14-bit CC pair can only address 0..=16383. Larger
-                // indices are silently dropped — the audio thread also
-                // re-validates, so this is belt-and-suspenders.
-                if (*idx as u32) <= crate::voicegroup::MAX_INSTRUMENT_INDEX {
-                    // `Release` pairs with the audio thread's `AcqRel`
-                    // swap; nothing on the UI side needs synchronizing
-                    // *before* this store, so a plain release is enough.
-                    self.pending_add_instrument
-                        .store(*idx as i32, Ordering::Release);
-                }
             }
             AppEvent::SwitchTab(tab) => {
                 self.active_tab = *tab;
@@ -200,7 +162,6 @@ pub(crate) fn default_state() -> Arc<ViziaState> {
 pub(crate) fn create(
     params: Arc<CComidiParams>,
     editor_state: Arc<ViziaState>,
-    pending_add_instrument: Arc<AtomicI32>,
 ) -> Option<Box<dyn Editor>> {
     create_vizia_editor(editor_state, ViziaTheming::Custom, move |cx, _| {
         cx.add_font_mem(include_bytes!("../Calamity-Regular.otf"));
@@ -210,8 +171,8 @@ pub(crate) fn create(
         // still works, it just won't animate.
         let _ = cx.add_stylesheet(INTERACTION_CSS);
 
-        // Synchronous initial load so the status line + instrument list
-        // are populated before the user ever touches Reload.
+        // Synchronous initial load so the status line is populated before
+        // the user ever touches Reload.
         let initial_state = load_voicegroup();
         let initial_status = format_status(&initial_state);
 
@@ -228,11 +189,8 @@ pub(crate) fn create(
 
         Data {
             params: params.clone(),
-            pending_add_instrument: pending_add_instrument.clone(),
             vg_status: initial_status,
             slots: initial_state.slots,
-            instruments: initial_state.available_instruments,
-            selected_instrument: 0,
             active_tab: Tab::Main,
             track_label: initial_label,
             track_label_storage,
@@ -367,7 +325,6 @@ fn main_tab_content(cx: &mut Context) {
 
     section_header(cx, "Voicegroup");
     voicegroup_row(cx);
-    add_instrument_row(cx);
 }
 
 /// The Additional Commands tab: a table of the freely-assignable rows.
@@ -534,32 +491,6 @@ fn voicegroup_row(cx: &mut Context) {
     .col_between(Pixels(8.0))
     .height(Pixels(26.0))
     .child_left(Pixels(12.0));
-}
-
-/// Voicegroup line 2: instrument PickList — picking an entry immediately
-/// fires the Add-Instrument CC pair (matching C++ "select = send" UX,
-/// no separate Add button needed).
-fn add_instrument_row(cx: &mut Context) {
-    HStack::new(cx, |cx| {
-        Label::new(cx, "Add instrument")
-            .font_size(11.0)
-            .width(Pixels(110.0))
-            .child_top(Stretch(1.0))
-            .child_bottom(Stretch(1.0));
-
-        // `PickList::new(cx, items_lens, selected_lens, show_chevron)`
-        // renders the currently-selected string as the collapsed view,
-        // and a scrollable list of all entries as the popup.
-        PickList::new(cx, Data::instruments, Data::selected_instrument, true)
-            .width(Pixels(360.0))
-            .cursor(CursorIcon::Hand)
-            .on_select(|cx, idx| {
-                cx.emit(AppEvent::SelectInstrument(idx));
-            });
-    })
-    .col_between(Pixels(8.0))
-    .height(Pixels(32.0))
-    .child_left(Pixels(16.0));
 }
 
 /// Small layout helper: caption above a control.
@@ -777,20 +708,9 @@ fn load_voicegroup() -> VoicegroupState {
 /// over success info so misconfiguration stands out.
 fn format_status(state: &VoicegroupState) -> String {
     if let Some(err) = &state.error {
-        if state.available_instruments.is_empty() {
-            return format!("⚠ {err}");
-        }
-        return format!(
-            "⚠ {}  ({} instruments available)",
-            err,
-            state.available_instruments.len()
-        );
+        return format!("⚠ {err}");
     }
-    format!(
-        "{} slots · {} instruments available",
-        state.slots.len(),
-        state.available_instruments.len()
-    )
+    format!("{} slots loaded", state.slots.len())
 }
 
 // -----------------------------------------------------------------------------

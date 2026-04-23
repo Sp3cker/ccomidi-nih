@@ -1,5 +1,4 @@
 use nih_plug::prelude::*;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
 // Some `SenderCore` helpers (getters, `reset`, etc.) are legitimate public
@@ -12,7 +11,6 @@ mod params;
 pub(crate) mod voicegroup;
 
 use params::CComidiParams;
-use voicegroup::{MAX_INSTRUMENT_INDEX, NO_PENDING_INSTRUMENT};
 
 pub struct CComidiPlugin {
     /// Host-synchronized parameter block (see `params.rs`). `Arc` because
@@ -24,21 +22,6 @@ pub struct CComidiPlugin {
     /// carries mutable per-block state (last-transport-playing, etc.) that
     /// only the audio thread touches.
     sender: core::SenderCore,
-
-    /// 14-bit instrument index the UI wants the audio thread to send as
-    /// the next CC#98/#99 pair. `-1` = nothing queued.
-    ///
-    /// Lives in an `Arc<AtomicI32>` so:
-    ///   - the editor thread can `store` into it from a button callback,
-    ///   - the audio thread can `swap` it back to -1 atomically,
-    ///   - no mutex / locking involved.
-    ///
-    /// Mirrors the `alignas(64) pendingAddInstrumentIndex` field in the
-    /// C++ plugin. On x86_64 / aarch64 a naked `AtomicI32` is already
-    /// cache-line isolated enough for our usage pattern (one writer, one
-    /// reader, handful of stores per minute). If false-sharing is ever
-    /// measured as an issue we can wrap in `CachePadded`.
-    pending_add_instrument: Arc<AtomicI32>,
 }
 
 impl Default for CComidiPlugin {
@@ -46,7 +29,6 @@ impl Default for CComidiPlugin {
         Self {
             params: Arc::new(CComidiParams::default()),
             sender: core::SenderCore::new(),
-            pending_add_instrument: Arc::new(AtomicI32::new(NO_PENDING_INSTRUMENT)),
         }
     }
 }
@@ -180,11 +162,7 @@ impl Plugin for CComidiPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(
-            self.params.clone(),
-            self.params.editor_state.clone(),
-            self.pending_add_instrument.clone(),
-        )
+        editor::create(self.params.clone(), self.params.editor_state.clone())
     }
 
     /// Called by the host every time the plugin is (re-)activated. We clear
@@ -220,33 +198,8 @@ impl Plugin for CComidiPlugin {
             context.send_event(ev);
         }
 
-        // 4. Add-Instrument 14-bit CC pair. The UI stores an index in
-        //    `pending_add_instrument`; we atomically swap it back to -1
-        //    and, if it was a valid 14-bit value, emit CC#98 (LSB) then
-        //    CC#99 (MSB) on the current target channel. Matches the
-        //    C++ behavior at ccomidi_plugin.cpp:614-632.
-        let pending = self
-            .pending_add_instrument
-            .swap(NO_PENDING_INSTRUMENT, Ordering::AcqRel);
-        if pending >= 0 && (pending as u32) <= MAX_INSTRUMENT_INDEX {
-            let idx = pending as u32;
-            context.send_event(NoteEvent::MidiCC {
-                timing: 0,
-                channel: target_channel,
-                cc: 98,
-                value: (idx & 0x7F) as f32 / 127.0,
-            });
-            context.send_event(NoteEvent::MidiCC {
-                timing: 0,
-                channel: target_channel,
-                cc: 99,
-                value: ((idx >> 7) & 0x7F) as f32 / 127.0,
-            });
-        }
-
-        // 5. Now tick the sender. Borrows `context` mutably via NihSink —
-        //    which is why the pass-through / Add-Instrument blocks above
-        //    had to run first.
+        // 4. Tick the sender. Borrows `context` mutably via NihSink —
+        //    which is why the pass-through block above had to run first.
         let mut sink = NihSink { ctx: context };
         self.sender.tick(is_playing, &mut sink);
 
@@ -254,14 +207,15 @@ impl Plugin for CComidiPlugin {
     }
 }
 
-impl ClapPlugin for CComidiPlugin {
-    const CLAP_ID: &'static str = "com.ccomidi.nih-prototype";
-    const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("NIH-plug + Vizia prototype for ccomidi");
-    const CLAP_MANUAL_URL: Option<&'static str> = None;
-    const CLAP_SUPPORT_URL: Option<&'static str> = None;
-    const CLAP_FEATURES: &'static [ClapFeature] =
-        &[ClapFeature::NoteEffect, ClapFeature::Utility];
+impl Vst3Plugin for CComidiPlugin {
+    // Stable 16-byte class ID. Hand-picked ASCII sentinel so the plugin
+    // presents a deterministic TUID across rebuilds; changing this
+    // invalidates any host state already saved against the plugin.
+    const VST3_CLASS_ID: [u8; 16] = *b"ccomidiNihV3Prot";
+    // MIDI-only note FX utility. Bitwig groups Fx+Tools plugins into the
+    // "Note FX" column of its VST3 browser.
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
 }
 
-nih_export_clap!(CComidiPlugin);
+nih_export_vst3!(CComidiPlugin);

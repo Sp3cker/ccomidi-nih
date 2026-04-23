@@ -7,8 +7,8 @@
 //! cargo xtask install <package> [--no-bundle]
 //! ```
 //!
-//! which (re)creates a *symlink* from the OS-appropriate CLAP plugin directory
-//! back into `target/bundled/<package>.clap`. The upshot: run it once per
+//! which (re)creates a *symlink* from the OS-appropriate VST3 plugin directory
+//! back into `target/bundled/<package>.vst3`. The upshot: run it once per
 //! cloned workspace, and every subsequent `cargo xtask bundle ... --release`
 //! is picked up by the host automatically — no re-copy, no re-install.
 
@@ -42,7 +42,7 @@ fn main() -> nih_plug_xtask::Result<()> {
 ///
 /// Steps:
 ///   1. Optionally (unless `--no-bundle`) invoke `cargo xtask bundle <pkg> --release`.
-///   2. Symlink `~/.../CLAP/<pkg>.clap` → `target/bundled/<pkg>.clap`.
+///   2. Symlink `~/.../VST3/<pkg>.vst3` → `target/bundled/<pkg>.vst3`.
 fn install_cmd(raw_args: Vec<String>) -> nih_plug_xtask::Result<()> {
     // --- tiny hand-rolled arg parser ------------------------------------
     // We avoid pulling in `clap` (or anything) since the workspace already
@@ -87,17 +87,17 @@ fn install_cmd(raw_args: Vec<String>) -> nih_plug_xtask::Result<()> {
     }
 
     // --- step 2: symlink per package ------------------------------------
-    let clap_dir = user_clap_plugin_dir()?;
-    std::fs::create_dir_all(&clap_dir)?;
+    let vst3_dir = user_vst3_plugin_dir()?;
+    std::fs::create_dir_all(&vst3_dir)?;
 
     for pkg in &packages {
-        link_one(pkg, &clap_dir)?;
+        link_one(pkg, &vst3_dir)?;
     }
     Ok(())
 }
 
-fn link_one(pkg: &str, clap_dir: &Path) -> nih_plug_xtask::Result<()> {
-    let bundle_name = format!("{pkg}.clap");
+fn link_one(pkg: &str, vst3_dir: &Path) -> nih_plug_xtask::Result<()> {
+    let bundle_name = format!("{pkg}.vst3");
     let src = std::env::current_dir()?
         .join("target")
         .join("bundled")
@@ -111,7 +111,7 @@ fn link_one(pkg: &str, clap_dir: &Path) -> nih_plug_xtask::Result<()> {
         );
     }
 
-    let dst = clap_dir.join(&bundle_name);
+    let dst = vst3_dir.join(&bundle_name);
 
     // If there's already something at dst, decide what to do:
     //   - a symlink (ours or anyone's): replace it (we own the name)
@@ -137,26 +137,25 @@ fn link_one(pkg: &str, clap_dir: &Path) -> nih_plug_xtask::Result<()> {
     Ok(())
 }
 
-/// Per-OS user-scope CLAP plugin directory.
+/// Per-OS user-scope VST3 plugin directory.
 ///
-/// Reference: <https://github.com/free-audio/clap/blob/main/include/clap/entry.h>
-fn user_clap_plugin_dir() -> nih_plug_xtask::Result<PathBuf> {
+/// Reference: <https://steinbergmedia.github.io/vst3_dev_portal/pages/Technical+Documentation/Locations+Format/Plugin+Format.html>
+fn user_vst3_plugin_dir() -> nih_plug_xtask::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP"))
+        Ok(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"))
     }
     #[cfg(target_os = "linux")]
     {
         let home = std::env::var("HOME")?;
-        Ok(PathBuf::from(home).join(".clap"))
+        Ok(PathBuf::from(home).join(".vst3"))
     }
     #[cfg(target_os = "windows")]
     {
-        // User-scope on Windows is `%LOCALAPPDATA%\Programs\Common\CLAP`,
-        // which maps to this env var on modern installs.
+        // User-scope on Windows is `%LOCALAPPDATA%\Programs\Common\VST3`.
         let appdata = std::env::var("LOCALAPPDATA")?;
-        Ok(PathBuf::from(appdata).join("Programs").join("Common").join("CLAP"))
+        Ok(PathBuf::from(appdata).join("Programs").join("Common").join("VST3"))
     }
 }
 
@@ -165,12 +164,12 @@ fn print_help() {
         "\
 cargo xtask install <package>... [flags]
 
-Builds each package's .clap bundle and symlinks it into the user-scope
-CLAP plugin directory. Idempotent — rerunning replaces stale symlinks,
+Builds each package's .vst3 bundle and symlinks it into the user-scope
+VST3 plugin directory. Idempotent — rerunning replaces stale symlinks,
 and never overwrites a non-symlink at the destination.
 
 Flags:
-  --no-bundle     skip the bundle step (assume target/bundled/<pkg>.clap
+  --no-bundle     skip the bundle step (assume target/bundled/<pkg>.vst3
                   already exists; useful for re-linking only)
   --universal     build as a universal (x86_64 + arm64) binary on macOS
 

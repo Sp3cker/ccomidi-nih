@@ -6,7 +6,7 @@
 //! # File format (abridged)
 //!
 //! The poryaaaa synth writes a JSON sidecar describing the current
-//! voicegroup and the list of instruments that can be appended to it:
+//! voicegroup:
 //!
 //! ```json
 //! {
@@ -15,10 +15,6 @@
 //!   "slots": [
 //!     { "program": 0, "name": "Organ" },
 //!     { "program": 1, "name": "Piano" }
-//!   ],
-//!   "availableInstruments": [
-//!     { "name": "Strings" },
-//!     { "name": "Brass" }
 //!   ]
 //! }
 //! ```
@@ -61,7 +57,6 @@ pub struct VoiceSlot {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoicegroupState {
     pub slots: Vec<VoiceSlot>,
-    pub available_instruments: Vec<String>,
     pub state_path: Option<PathBuf>,
     pub error: Option<String>,
     /// Last-known mtime of the state file, as nanoseconds since the UNIX
@@ -82,19 +77,19 @@ pub struct VoicegroupState {
 ///   2. Candidate list (first existing file wins):
 ///      - `<N levels up from the loaded .so/bundle>/poryaaaa_state.json`
 ///        for a handful of N's, covering:
-///          · macOS bundle layout (`bundle.clap/Contents/MacOS/binary`)
+///          · macOS bundle layout (`bundle.vst3/Contents/MacOS/binary`)
 ///            → 4 levels
-///          · Linux/Windows single-file `.clap` → 1 level
-///          · Bare dev install (`target/bundled/X.clap/…`) resolves to
+///          · Linux/Windows single-file `.vst3` → 1 level
+///          · Bare dev install (`target/bundled/X.vst3/…`) resolves to
 ///            `target/bundled/` which is probably not where poryaaaa
 ///            wrote; higher levels may be the right answer if the user
-///            symlinked the bundle into their CLAP dir
+///            symlinked the bundle into their VST3 dir
 ///      - The canonicalized version of the above (handles the case
 ///        where `dladdr` returned the symlink target instead of the
 ///        install path)
-///      - `~/Library/Audio/Plug-Ins/CLAP/poryaaaa_state.json` on macOS
-///        / `~/.clap/poryaaaa_state.json` on Linux — the standard
-///        user-scope CLAP plugin directory where poryaaaa itself likely
+///      - `~/Library/Audio/Plug-Ins/VST3/poryaaaa_state.json` on macOS
+///        / `~/.vst3/poryaaaa_state.json` on Linux — the standard
+///        user-scope VST3 plugin directory where poryaaaa itself likely
 ///        lives
 ///   3. If no candidate exists on disk, returns the first one anyway so
 ///      the UI error message can point the user at *where* we looked.
@@ -131,18 +126,18 @@ fn candidate_state_paths() -> Vec<PathBuf> {
         }
     }
 
-    // User-scope CLAP directory fallback — this is the install location
+    // User-scope VST3 directory fallback — this is the install location
     // for poryaaaa, so `poryaaaa_state.json` probably ends up here even
     // if ccomidi-nih is living somewhere else (dev build, alt install).
     #[cfg(target_os = "macos")]
     if let Ok(home) = std::env::var("HOME") {
         out.push(
-            PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP/poryaaaa_state.json"),
+            PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3/poryaaaa_state.json"),
         );
     }
     #[cfg(target_os = "linux")]
     if let Ok(home) = std::env::var("HOME") {
-        out.push(PathBuf::from(home).join(".clap/poryaaaa_state.json"));
+        out.push(PathBuf::from(home).join(".vst3/poryaaaa_state.json"));
     }
 
     // Windows fallback — dladdr isn't available, so we rely on env-var
@@ -160,11 +155,11 @@ fn candidate_state_paths() -> Vec<PathBuf> {
 /// Build the candidate list "walk up from `lib` looking for siblings".
 ///
 /// We walk up to 5 levels. That covers:
-///   - Linux/Windows flat `.clap`: level 1
+///   - Linux/Windows flat `.vst3`: level 1
 ///   - macOS bundle: level 4 (bundle/Contents/MacOS/binary)
 ///   - anything deeper (dev builds nested inside target/bundled/): the
 ///     higher levels are still plausible locations if the user symlinked
-///     the bundle into the OS CLAP dir
+///     the bundle into the OS VST3 dir
 fn state_candidates_around(lib: &Path) -> Vec<PathBuf> {
     let mut v = Vec::new();
     let mut dir = lib.parent();
@@ -210,20 +205,12 @@ fn current_library_path() -> Option<PathBuf> {
 struct RawState {
     #[serde(default)]
     slots: Vec<RawSlot>,
-    #[serde(default, rename = "availableInstruments")]
-    available_instruments: Vec<RawInstrument>,
 }
 
 #[derive(Deserialize)]
 struct RawSlot {
     #[serde(default)]
     program: i64,
-    #[serde(default)]
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct RawInstrument {
     #[serde(default)]
     name: String,
 }
@@ -282,14 +269,6 @@ pub fn load_state(path: &std::path::Path) -> VoicegroupState {
         });
     }
 
-    // Available instruments: just collect the non-empty names.
-    for inst in raw.available_instruments {
-        if inst.name.is_empty() {
-            continue;
-        }
-        out.available_instruments.push(inst.name);
-    }
-
     if out.slots.is_empty() {
         out.error = Some("state.json has no sample-bearing slots.".to_string());
     }
@@ -314,20 +293,6 @@ fn system_time_to_ns(t: SystemTime) -> Option<u128> {
 fn duration_to_ns(d: Duration) -> u128 {
     d.as_secs() as u128 * 1_000_000_000 + d.subsec_nanos() as u128
 }
-
-// -----------------------------------------------------------------------------
-// 14-bit CC range (CC#98 LSB + CC#99 MSB)
-// -----------------------------------------------------------------------------
-
-/// Max valid index for the Add-Instrument CC pair.
-///
-/// The index is transmitted as two 7-bit CCs (LSB = CC#98, MSB = CC#99),
-/// giving a 14-bit value: 0..=16383.
-pub const MAX_INSTRUMENT_INDEX: u32 = 0x3FFF; // 16383
-
-/// Sentinel meaning "nothing queued" for the audio-thread-observable
-/// pending-add-instrument atomic.
-pub const NO_PENDING_INSTRUMENT: i32 = -1;
 
 // -----------------------------------------------------------------------------
 // Instrument-kind classification (name heuristic)
@@ -445,12 +410,11 @@ mod tests {
                 name: "Organ".into()
             }]
         );
-        assert!(state.available_instruments.is_empty());
         assert!(state.mtime_ns.is_some());
     }
 
     #[test]
-    fn parses_full_state_with_instruments() {
+    fn parses_full_state() {
         let path = write_tmp(
             "full.json",
             r#"{
@@ -459,10 +423,6 @@ mod tests {
                 "slots": [
                     {"program": 10, "name": "Piano"},
                     {"program": 20, "name": "Bass"}
-                ],
-                "availableInstruments": [
-                    {"name": "Strings"},
-                    {"name": "Brass"}
                 ]
             }"#,
         );
@@ -471,7 +431,6 @@ mod tests {
         assert_eq!(state.slots.len(), 2);
         assert_eq!(state.slots[0].program, 10);
         assert_eq!(state.slots[1].name, "Bass");
-        assert_eq!(state.available_instruments, vec!["Strings", "Brass"]);
     }
 
     #[test]
@@ -509,14 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_slots_reports_error_but_loads_instruments() {
-        let path = write_tmp(
-            "empty.json",
-            r#"{"slots":[], "availableInstruments":[{"name":"X"}]}"#,
-        );
+    fn empty_slots_reports_error() {
+        let path = write_tmp("empty.json", r#"{"slots":[]}"#);
         let state = load_state(&path);
         assert!(state.error.is_some()); // "no sample-bearing slots"
-        assert_eq!(state.available_instruments, vec!["X"]);
     }
 
     #[test]
